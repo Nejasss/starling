@@ -1,0 +1,209 @@
+[mod]
+id = "waymap"
+version = "0.2.1"
+priority = 100
+
+# The minimap view and draw hooks below are internal Horizon functions, so the
+# bundle is pinned to the exact commit it was tested on.
+[compatibility]
+horizon_revision = "6475f62f3c834b7489e1816bf47f47ea5eb2b879"
+
+# The mod's state, waypoints, projection and HUD code (`game::waymap`).
+[[module]]
+id = "waymap"
+file = "crates/horizon-client/src/game.rs"
+name = "waymap"
+source = "waymap.rs"
+
+# The minimap overlay lives in the client library, where `draw_minimap` is:
+# the game module (the binary) pushes its dots here. `pub` so the binary can
+# reach it.
+[[module]]
+id = "minimap_draw"
+file = "crates/horizon-client/src/extras_hud.rs"
+name = "waymap_minimap"
+source = "minimap_lib.rs"
+visibility = "pub"
+
+# Once a frame (`native_frame`): load the waypoints, forget the last frame's
+# minimap geometry.
+[[injection]]
+id = "frame"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_frame"
+helper = "frame.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+]
+
+# The mod's row in Options > Mods (from `native_mods`).
+[[injection]]
+id = "list"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_mods"
+helper = "list.rs"
+bindings = [
+  { name = "mods", ty = "&mut Vec<crate::game::native_hooks::NativeMod>", value = "&mut *mods" },
+]
+
+# The buttons of the mod's settings page.
+[[injection]]
+id = "settings"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_settings"
+helper = "settings.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "mod_id", ty = "&str", value = "mod_id" },
+  { name = "buttons", ty = "&mut Vec<String>", value = "&mut *buttons" },
+]
+
+# A click on the settings page (from `native_settings_click`).
+[[injection]]
+id = "click"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_settings_click"
+helper = "click.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "mod_id", ty = "&str", value = "mod_id" },
+  { name = "button", ty = "usize", value = "button" },
+]
+
+# `/wp ...` (from `native_command`).
+[[injection]]
+id = "command"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_command"
+helper = "command.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "command", ty = "&str", value = "command" },
+  { name = "ran", ty = "&mut bool", value = "&mut *ran" },
+]
+
+# Keys: add a waypoint, toggle the list panel.
+[[injection]]
+id = "key"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_key"
+helper = "key.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "key", ty = "&str", value = "key" },
+  { name = "pressed", ty = "bool", value = "pressed" },
+]
+
+# The HUD: markers in the world, dots on the minimap, the list panel.
+[[injection]]
+id = "hud"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_hud"
+helper = "hud.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "&mut *batch" },
+  { name = "corners", ty = "&mut horizon_client::extras_hud::Corners", value = "&mut *corners" },
+]
+
+# The minimap's world view (centre, yaw, blocks per pixel), once per frame,
+# so the markers can be placed on its image. `minimap_shown` is private to
+# `game::extras`, so the helper asks it from there (`draw_extras` itself has a
+# closure, which interior hooks refuse).
+[[injection]]
+id = "minimap_view"
+kind = "HEAD"
+target = "horizon_client::game::extras::Game<'_>::update_minimap"
+helper = "minimap_view.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+]
+
+# The minimap image, with the waypoints drawn over it. Horizon's own body is
+# skipped (its rotation closure rules out a site hook or an overwrite); the
+# helper draws the same map and adds a dot per waypoint.
+[[injection]]
+id = "minimap"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client_lib::extras_hud::draw_minimap"
+helper = "minimap.rs"
+bindings = [
+  { name = "batch", ty = "&mut crate::hud::HudBatch", value = "&mut *batch" },
+  { name = "atlas", ty = "&crate::hud::HudAtlas", value = "atlas" },
+  { name = "corners", ty = "&mut crate::extras_hud::Corners", value = "&mut *corners" },
+  { name = "look", ty = "&crate::extras_hud::MinimapLook", value = "look" },
+]
+
+# The screen render post (native_screen_render_post).
+[[injection]]
+id = "screen_render"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_screen_render_post"
+helper = "screen.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "batch" },
+  { name = "screen", ty = "&crate::game::native_hooks::NativeScreenView<'_>", value = "screen" },
+]
+
+# The screen mouse button pressed (native_screen_mouse_button_pressed_pre).
+[[injection]]
+id = "screen_mouse"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client::game::native_hooks::Game<'_>::native_screen_mouse_button_pressed_pre"
+helper = "mouse.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "screen", ty = "&crate::game::native_hooks::NativeScreenView<'_>", value = "screen" },
+  { name = "button", ty = "i32", value = "button" },
+  { name = "modifiers", ty = "u32", value = "modifiers" },
+  { name = "canceled", ty = "&mut bool", value = "canceled" },
+]
+
+# The screen mouse scrolled (native_screen_mouse_scrolled_pre).
+[[injection]]
+id = "screen_scroll"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client::game::native_hooks::Game<'_>::native_screen_mouse_scrolled_pre"
+helper = "scroll.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "screen", ty = "&crate::game::native_hooks::NativeScreenView<'_>", value = "screen" },
+  { name = "scroll", ty = "[f64; 2]", value = "scroll" },
+  { name = "modifiers", ty = "u32", value = "modifiers" },
+  { name = "canceled", ty = "&mut bool", value = "canceled" },
+]
+
+# The screen key pressed (native_screen_key_pressed_pre).
+[[injection]]
+id = "screen_key"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client::game::native_hooks::Game<'_>::native_screen_key_pressed_pre"
+helper = "keys.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "screen", ty = "&crate::game::native_hooks::NativeScreenView<'_>", value = "screen" },
+  { name = "key", ty = "&str", value = "key" },
+  { name = "repeat", ty = "bool", value = "repeat" },
+  { name = "modifiers", ty = "u32", value = "modifiers" },
+  { name = "canceled", ty = "&mut bool", value = "canceled" },
+]
+
+# The screen char typed (native_screen_char_typed_pre).
+[[injection]]
+id = "screen_char"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client::game::native_hooks::Game<'_>::native_screen_char_typed_pre"
+helper = "chars.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "screen", ty = "&crate::game::native_hooks::NativeScreenView<'_>", value = "screen" },
+  { name = "c", ty = "char", value = "c" },
+  { name = "modifiers", ty = "u32", value = "modifiers" },
+  { name = "canceled", ty = "&mut bool", value = "canceled" },
+]

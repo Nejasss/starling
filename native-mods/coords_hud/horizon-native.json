@@ -1,0 +1,9 @@
+{
+  "game": "26.3",
+  "hooks": 1,
+  "horizon": "4baa571566e39bfd6594988d3bb2bc85440c30e7",
+  "id": "coords_hud",
+  "mixins": "0d6b103c70633d8fd9443d8d0acd3aadaacedb06",
+  "schema": 1,
+  "version": "2.0.0"
+}
