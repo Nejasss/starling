@@ -151,18 +151,19 @@ fn bridging_assist_use_head(
             continue;
         };
 
-        // Click the solid support block. The hit face points from the
-        // support block toward the empty candidate cell.
-        let support = [pos[0] + face[0], pos[1] + face[1], pos[2] + face[2]];
+        // Match Bridging Mod's Bridge.getDefaultPlaceAssistTarget:
+        // target the empty candidate cell itself, use the opposite of the
+        // support-side direction as the clicked face, and click its center.
+        // Starling's ordinary BlockItem placement pipeline then resolves the
+        // replaceable candidate as the actual placement position.
         let placement_face = bridging::placement_hit_face(face);
-
         let hit = crate::game::Hit {
-            pos: support,
+            pos,
             face: placement_face,
             point: [
-                cell_min[0] + 0.5 + f64::from(face[0]) * 0.5,
-                cell_min[1] + 0.5 + f64::from(face[1]) * 0.5,
-                cell_min[2] + 0.5 + f64::from(face[2]) * 0.5,
+                cell_min[0] + 0.5,
+                cell_min[1] + 0.5,
+                cell_min[2] + 0.5,
             ],
         };
         // InteractionInput captures a per-tick hit before dispatching use.
