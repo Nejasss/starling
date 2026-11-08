@@ -46,3 +46,12 @@ bindings = [
   { name = "conn", ty = "u32", value = "conn" },
   { name = "command", ty = "&str", value = "command" },
 ]
+
+[[injection]]
+id = "list"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_mods"
+helper = "list.rs"
+bindings = [
+  { name = "mods", ty = "&mut Vec<crate::game::native_hooks::NativeMod>", value = "&mut *mods" },
+]

@@ -22,7 +22,8 @@ fn bridging_assist_use_head(
     let settings = bridging::Settings::read(|key| game.native_setting(bridging::ID, key));
     if !settings.enabled
         || (settings.crouch_only
-            && !game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft))
+            && !game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft)
+            && !game.keys.contains(&winit::keyboard::KeyCode::ShiftRight))
     {
         return;
     }
@@ -57,36 +58,20 @@ fn bridging_assist_use_head(
         return;
     }
 
-    // Bridging Mod starts partway along the camera-to-player reach ray. In
-    // first person (including touch aim) the two perspectives coincide.
-    let player_ray_end = [
-        player_eye[0] + direction[0] * reach,
-        player_eye[1] + direction[1] * reach,
-        player_eye[2] + direction[2] * reach,
-    ];
-    let distance = ((player_ray_end[0] - origin[0]).powi(2)
-        + (player_ray_end[1] - origin[1]).powi(2)
-        + (player_ray_end[2] - origin[2]).powi(2))
-    .sqrt();
-    if !distance.is_finite() || distance <= 0.0 {
+    // Bridging Mod measures the reach endpoint from the player's own
+    // perspective, then traverses from the camera perspective for that
+    // distance. These directions differ in detached/third-person views.
+    let player_direction = crate::game::view_vector(game.yaw, game.pitch);
+    let Some(candidates) = bridging::candidate_path(
+        origin,
+        direction,
+        player_eye,
+        player_direction,
+        reach,
+        settings.min_distance_percent,
+    ) else {
         return;
-    }
-    let fraction = f64::from(settings.min_distance_percent) / 100.0;
-    let start = [
-        origin[0] + direction[0] * distance * fraction,
-        origin[1] + direction[1] * distance * fraction,
-        origin[2] + direction[2] * distance * fraction,
-    ];
-    // The traversal itself follows the camera ray for the distance measured
-    // to the player's reach endpoint, matching Bridging Mod's two-perspective
-    // path construction.
-    let path_end = [
-        origin[0] + direction[0] * distance,
-        origin[1] + direction[1] * distance,
-        origin[2] + direction[2] * distance,
-    ];
-    let floor = |point: [f64; 3]| point.map(|axis| axis.floor() as i32);
-    let candidates = bridging::voxel_line(floor(start), floor(path_end));
+    };
 
     let Some(player) = game.player.as_ref() else {
         return;
@@ -167,10 +152,19 @@ fn bridging_assist_use_head(
             continue;
         };
 
+        // Click the solid support block. The hit face points from the
+        // support block toward the empty candidate cell.
+        let support = [pos[0] + face[0], pos[1] + face[1], pos[2] + face[2]];
+        let placement_face = bridging::placement_hit_face(face);
+
         let hit = crate::game::Hit {
-            pos,
-            face,
-            point: [cell_min[0] + 0.5, cell_min[1] + 0.5, cell_min[2] + 0.5],
+            pos: support,
+            face: placement_face,
+            point: [
+                cell_min[0] + 0.5 + f64::from(face[0]) * 0.5,
+                cell_min[1] + 0.5 + f64::from(face[1]) * 0.5,
+                cell_min[2] + 0.5 + f64::from(face[2]) * 0.5,
+            ],
         };
         game.tick_hit = Some(Some(hit));
         bridging::arm_override();

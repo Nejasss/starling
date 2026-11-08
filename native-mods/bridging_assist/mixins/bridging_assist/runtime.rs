@@ -8,9 +8,9 @@
 use std::cell::Cell;
 
 pub const ID: &str = "bridging_assist";
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.2.0";
 pub const DESCRIPTION: &str =
-    "Find a supported placement cell just beyond the normal crosshair target.";
+    "Reacharound placement using separate camera and player perspectives.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Settings {
@@ -118,6 +118,81 @@ pub fn arm_override() {
 
 pub fn take_override() -> bool {
     OVERRIDE_ACTIVE.with(|active| active.replace(false))
+}
+
+
+/// Builds Bridging Mod's two-perspective voxel path.
+///
+/// The path starts at the camera perspective, but its length is measured to
+/// the endpoint of the player's own reach ray. This distinction matters in
+/// detached/third-person camera modes; using the camera direction for both
+/// rays shortens or lengthens the candidate path incorrectly.
+pub fn candidate_path(
+    camera_origin: [f64; 3],
+    camera_direction: [f64; 3],
+    player_eye: [f64; 3],
+    player_direction: [f64; 3],
+    reach: f64,
+    min_distance_percent: u8,
+) -> Option<Vec<[i32; 3]>> {
+    if !reach.is_finite()
+        || reach <= 0.0
+        || !(5..=80).contains(&min_distance_percent)
+        || camera_origin
+            .into_iter()
+            .chain(camera_direction)
+            .chain(player_eye)
+            .chain(player_direction)
+            .any(|value| !value.is_finite())
+    {
+        return None;
+    }
+
+    let player_end = [
+        player_eye[0] + player_direction[0] * reach,
+        player_eye[1] + player_direction[1] * reach,
+        player_eye[2] + player_direction[2] * reach,
+    ];
+    let distance = ((player_end[0] - camera_origin[0]).powi(2)
+        + (player_end[1] - camera_origin[1]).powi(2)
+        + (player_end[2] - camera_origin[2]).powi(2))
+    .sqrt();
+    if !distance.is_finite() || distance <= f64::EPSILON {
+        return None;
+    }
+
+    let fraction = f64::from(min_distance_percent) / 100.0;
+    let start = [
+        camera_origin[0] + camera_direction[0] * distance * fraction,
+        camera_origin[1] + camera_direction[1] * distance * fraction,
+        camera_origin[2] + camera_direction[2] * distance * fraction,
+    ];
+    let end = [
+        camera_origin[0] + camera_direction[0] * distance,
+        camera_origin[1] + camera_direction[1] * distance,
+        camera_origin[2] + camera_direction[2] * distance,
+    ];
+
+    fn cell(point: [f64; 3]) -> Option<[i32; 3]> {
+        let mut result = [0; 3];
+        for axis in 0..3 {
+            let value = point[axis].floor();
+            if !value.is_finite() || value < i32::MIN as f64 || value > i32::MAX as f64 {
+                return None;
+            }
+            result[axis] = value as i32;
+        }
+        Some(result)
+    }
+
+    Some(voxel_line(cell(start)?, cell(end)?))
+}
+
+/// The native equivalent of the upstream result's opposite-side hit face.
+/// The support-side vector points from the candidate toward its support;
+/// the hit face sent to the ordinary placement pipeline points the other way.
+pub fn placement_hit_face(support_face: [i32; 3]) -> [i32; 3] {
+    [-support_face[0], -support_face[1], -support_face[2]]
 }
 
 /// Integer 3-D Bresenham traversal, including both endpoints, in camera-to-
@@ -240,5 +315,40 @@ mod tests {
         assert_eq!(voxel_line([0, 0, 0], [0, 0, 3]).last(), Some(&[0, 0, 3]));
         let line = voxel_line([0, 0, 0], [3, 3, 3]);
         assert_eq!(line, vec![[0, 0, 0], [1, 1, 1], [2, 2, 2], [3, 3, 3]]);
+    }
+
+    #[test]
+    fn candidate_path_uses_player_ray_length_and_camera_ray_direction() {
+        let path = candidate_path(
+            [0.5, 5.5, 0.5],
+            [1.0, 0.0, 0.0],
+            [0.5, 5.5, 0.5],
+            [0.0, 0.0, 1.0],
+            5.0,
+            20,
+        )
+        .unwrap();
+        assert_eq!(
+            path,
+            vec![[1, 5, 0], [2, 5, 0], [3, 5, 0], [4, 5, 0], [5, 5, 0]]
+        );
+    }
+
+    #[test]
+    fn candidate_path_rejects_invalid_geometry() {
+        assert!(candidate_path(
+            [0.0; 3], [1.0, 0.0, 0.0], [0.0; 3], [1.0, 0.0, 0.0],
+            0.0, 20
+        ).is_none());
+        assert!(candidate_path(
+            [f64::NAN, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0; 3], [1.0, 0.0, 0.0],
+            5.0, 20
+        ).is_none());
+    }
+
+    #[test]
+    fn placement_hit_face_points_from_candidate_toward_support() {
+        assert_eq!(placement_hit_face([0, 1, 0]), [0, -1, 0]);
+        assert_eq!(placement_hit_face([-1, 0, 0]), [1, 0, 0]);
     }
 }
