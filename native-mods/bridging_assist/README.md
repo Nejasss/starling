@@ -1,8 +1,16 @@
-# Bridging Assist for Starling — 0.4.2
+# Bridging Assist for Starling — 0.4.3
 
 A native `.hnmod` reacharound-placement implementation inspired by Bridging Mod 2.7.0 for Minecraft 26.3.
 
-## Changes in 0.4.2
+## Changes in 0.4.3
+
+- Horizontal placement now flattens the camera/player rays onto XZ and locks the target block Y to the last grounded block plane, preventing camera pitch from creating a staircase.
+- Horizontal mode forces primary-path traversal without corner/edge adjacency candidates, reducing side placements that can obstruct the player's route.
+- Preview no longer ray-tests every mob every client tick; entity protection remains in the actual placement hook.
+- Crosshair and outline rendering read only their own visibility flags instead of parsing the full settings set every frame.
+- Defaults path adjacency to disabled and uses a new persisted key so the older 0.4.2 CORNERS value cannot silently restore the expensive path.
+
+## Previous changes in 0.4.2
 
 - Restores the directional crosshair marker around the vanilla reticle and restores the target-block outline.
 - Computes one valid candidate per client tick and shares it between placement, crosshair and outline. The outline hook only draws the cached box; it does not scan the world every rendered frame.

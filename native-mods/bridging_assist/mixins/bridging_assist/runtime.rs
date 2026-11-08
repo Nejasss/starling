@@ -8,7 +8,7 @@
 use std::cell::Cell;
 
 pub const ID: &str = "bridging_assist";
-pub const VERSION: &str = "0.4.2";
+pub const VERSION: &str = "0.4.3";
 pub const DESCRIPTION: &str =
     "Reacharound placement using separate camera and player perspectives.";
 pub const KEY: &str = "toggle";
@@ -82,7 +82,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self { enabled: true, crouch_only: false, replace_non_solid: true, skip_torches: true,
-            min_distance_percent: 20, adjacency: AdjacencyMode::Corners, snap_strength_percent: 100,
+            min_distance_percent: 20, adjacency: AdjacencyMode::Disabled, snap_strength_percent: 100,
             axis_mode: AxisMode::Horizontal, crouch_axis_override: AxisOverride::Fallback,
             perspective: PerspectiveMode::Auto, slab_assist: true, post_delay_ticks: 3,
             show_crosshair: true, show_outline: true }
@@ -97,7 +97,7 @@ impl Settings {
             enabled: boolean("enabled", d.enabled), crouch_only: boolean("crouch_only", d.crouch_only),
             replace_non_solid: boolean("replace_non_solid", d.replace_non_solid), skip_torches: boolean("skip_torches", d.skip_torches),
             min_distance_percent: number("min_distance_percent", d.min_distance_percent, 100),
-            adjacency: AdjacencyMode::parse(get("adjacency"), d.adjacency),
+            adjacency: AdjacencyMode::parse(get("path_adjacency"), d.adjacency),
             snap_strength_percent: number("snap_strength_percent", d.snap_strength_percent, 100),
             // Fresh keys avoid silently restoring the old BOTH/1-tick profile.
             axis_mode: AxisMode::parse(get("placement_axes"), d.axis_mode),
@@ -147,7 +147,7 @@ impl Settings {
         [
             ("enabled", flag(self.enabled)), ("crouch_only", flag(self.crouch_only)),
             ("replace_non_solid", flag(self.replace_non_solid)), ("skip_torches", flag(self.skip_torches)),
-            ("min_distance_percent", self.min_distance_percent.to_string()), ("adjacency", self.adjacency.as_str().to_owned()),
+            ("min_distance_percent", self.min_distance_percent.to_string()), ("path_adjacency", self.adjacency.as_str().to_owned()),
             ("snap_strength_percent", self.snap_strength_percent.to_string()), ("placement_axes", self.axis_mode.as_str().to_owned()),
             ("crouch_axis_override", self.crouch_axis_override.as_str().to_owned()), ("perspective", self.perspective.as_str().to_owned()),
             ("slab_assist", flag(self.slab_assist)), ("placement_interval_ticks", self.post_delay_ticks.to_string()),
@@ -208,8 +208,36 @@ pub fn remaining_use_delay(current: u32, interval_ticks: u8) -> u32 {
 thread_local! {
     static LAST_GROUNDED_Y_FRAC: Cell<f64> = const { Cell::new(0.0) };
 }
-pub fn remember_grounded_y_fraction(y: f64, on_ground: bool) { if on_ground && y.is_finite() { LAST_GROUNDED_Y_FRAC.with(|value| value.set(y.rem_euclid(1.0))); } }
+thread_local! {
+    static LAST_GROUNDED_BLOCK_Y: Cell<Option<i32>> = const { Cell::new(None) };
+}
+fn block_below_feet(y: f64) -> Option<i32> {
+    let block_y = (y - 1.0e-4).floor();
+    (block_y.is_finite() && block_y >= i32::MIN as f64 && block_y <= i32::MAX as f64)
+        .then_some(block_y as i32)
+}
+pub fn remember_grounded_y_fraction(y: f64, on_ground: bool) {
+    if on_ground && y.is_finite() {
+        LAST_GROUNDED_Y_FRAC.with(|value| value.set(y.rem_euclid(1.0)));
+        if let Some(block_y) = block_below_feet(y) {
+            LAST_GROUNDED_BLOCK_Y.with(|value| value.set(Some(block_y)));
+        }
+    }
+}
 pub fn last_grounded_y_fraction() -> f64 { LAST_GROUNDED_Y_FRAC.with(|value| value.get()) }
+pub fn grounded_block_y(fallback_player_y: f64) -> Option<i32> {
+    LAST_GROUNDED_BLOCK_Y.with(|value| value.get()).or_else(|| block_below_feet(fallback_player_y))
+}
+/// Normalize a view vector onto the horizontal XZ plane. A near-vertical view
+/// has no stable horizontal direction and must use the caller's yaw fallback.
+pub fn horizontal_direction(direction: [f64; 3]) -> Option<[f64; 3]> {
+    let length_sq = direction[0] * direction[0] + direction[2] * direction[2];
+    if !length_sq.is_finite() || length_sq <= 1.0e-12 {
+        return None;
+    }
+    let inverse_length = length_sq.sqrt().recip();
+    Some([direction[0] * inverse_length, 0.0, direction[2] * inverse_length])
+}
 
 
 /// Builds Bridging Mod's two-perspective voxel path.
@@ -540,17 +568,33 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_direction_and_grounded_level_are_stable() {
+        assert_eq!(horizontal_direction([3.0, 8.0, 4.0]), Some([0.6, 0.0, 0.8]));
+        assert_eq!(horizontal_direction([0.0, -1.0, 0.0]), None);
+        remember_grounded_y_fraction(65.0, true);
+        assert_eq!(grounded_block_y(70.0), Some(64));
+        remember_grounded_y_fraction(70.0, false);
+        assert_eq!(grounded_block_y(70.0), Some(64));
+    }
+
+    #[test]
+    fn old_corner_adjacency_setting_does_not_override_safe_default() {
+        let settings = Settings::read(stored(&[("adjacency", "corners")]));
+        assert_eq!(settings.adjacency, AdjacencyMode::Disabled);
+    }
+
+    #[test]
     fn invalid_values_fall_back_to_safe_defaults() {
         let settings = Settings::read(stored(&[
             ("enabled", "maybe"),
             ("crouch_only", "false"),
             ("min_distance_percent", "255"),
-            ("adjacency", "invalid"),
+            ("path_adjacency", "invalid"),
             ("snap_strength_percent", "999"),
-            ("axis_mode", "invalid"),
+            ("placement_axes", "invalid"),
             ("crouch_axis_override", "invalid"),
             ("perspective", "invalid"),
-            ("post_delay_ticks", "255"),
+            ("placement_interval_ticks", "255"),
             ]));
         assert!(settings.enabled);
         assert!(!settings.crouch_only);

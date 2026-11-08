@@ -42,13 +42,19 @@ fn bridging_assist_use_head(
     }
 
     let Some((pos, face)) = bridging::visual_target() else { return; };
-    if !settings.effective_axis(crouching).allows(face) {
+    let allowed_axes = settings.effective_axis(crouching);
+    if !allowed_axes.allows(face) {
         return;
     }
 
     // Revalidate the target because the world/player may have changed since
     // the preceding tick. This prevents stale previews from placing blocks.
     let Some(player) = game.player.as_ref() else { return; };
+    if allowed_axes == bridging::AxisMode::Horizontal
+        && bridging::grounded_block_y(player.position.y) != Some(pos[1])
+    {
+        return;
+    }
     let half_width = f64::from(player.dimensions.width) * 0.5;
     let player_min = [
         player.position.x - half_width,

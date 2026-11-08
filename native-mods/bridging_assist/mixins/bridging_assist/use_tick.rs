@@ -18,8 +18,6 @@ fn bridging_assist_use_tick(game: &mut crate::game::Game<'_>) {
         || game.sleeping.is_some()
         || game.using.is_some()
         || game.forced_hit.is_some()
-        || game.entity_targeted()
-        || game.pick().is_some()
     {
         return;
     }
@@ -63,6 +61,12 @@ fn bridging_assist_use_tick(game: &mut crate::game::Game<'_>) {
         return;
     }
 
+    // Entity targeting is deliberately left to the actual click hook. Doing a
+    // full mob ray scan here every client tick made preview expensive in busy worlds.
+    if game.pick().is_some() {
+        return;
+    }
+
     let Some((aim_origin, aim_direction)) = game.aim() else { return; };
     let Some(player_eye) = game.eye_position() else { return; };
     let Some(player) = game.player.as_ref() else { return; };
@@ -80,14 +84,43 @@ fn bridging_assist_use_tick(game: &mut crate::game::Game<'_>) {
             (camera_origin, camera_direction)
         }
     };
+
+    // Horizontal means a genuinely level bridge: flatten both traversal rays
+    // and lock every candidate to the last grounded block plane. Only the
+    // camera yaw determines the forward XZ direction, never camera pitch.
+    let horizontal_lock = allowed_axes == bridging::AxisMode::Horizontal;
+    let (direction, player_path_direction, target_y) = if horizontal_lock {
+        let yaw_fallback = crate::game::view_vector(game.yaw, 0.0);
+        let Some(direction) = bridging::horizontal_direction(direction)
+            .or_else(|| bridging::horizontal_direction(yaw_fallback))
+        else {
+            return;
+        };
+        let Some(player_path_direction) = bridging::horizontal_direction(player_direction)
+            .or_else(|| bridging::horizontal_direction(yaw_fallback))
+        else {
+            return;
+        };
+        let Some(target_y) = bridging::grounded_block_y(player.position.y) else {
+            return;
+        };
+        (direction, player_path_direction, Some(target_y))
+    } else {
+        (direction, player_direction, None)
+    };
+    let adjacency = if horizontal_lock {
+        bridging::AdjacencyMode::Disabled
+    } else {
+        settings.adjacency
+    };
     let Some(candidates) = bridging::candidate_path_with_options(
         origin,
         direction,
         player_eye,
-        player_direction,
+        player_path_direction,
         game.block_reach,
         settings.min_distance_percent,
-        settings.adjacency,
+        adjacency,
         settings.snap_strength_percent,
     ) else {
         return;
@@ -115,7 +148,10 @@ fn bridging_assist_use_tick(game: &mut crate::game::Game<'_>) {
     ];
     let facts = game.res.facts();
 
-    for pos in candidates {
+    for mut pos in candidates {
+        if let Some(target_y) = target_y {
+            pos[1] = target_y;
+        }
         let cell_min = [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])];
         let cell_max = [cell_min[0] + 1.0, cell_min[1] + 1.0, cell_min[2] + 1.0];
         if (0..3).all(|axis| cell_min[axis] < player_max[axis] && cell_max[axis] > player_min[axis]) {
