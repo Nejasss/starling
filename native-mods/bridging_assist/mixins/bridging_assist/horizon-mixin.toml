@@ -1,6 +1,6 @@
 [mod]
 id = "bridging_assist"
-version = "0.4.2"
+version = "0.4.4"
 priority = 100
 
 # The runtime implementation is independent of the game types. The adapters

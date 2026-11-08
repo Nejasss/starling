@@ -2,6 +2,9 @@
 // assisted use, then refresh one target for placement and both visuals.
 // The path/support scan runs once per tick, not once per rendered frame.
 fn bridging_assist_use_tick(game: &mut crate::game::Game<'_>) {
+    if !game.native_window() {
+        return;
+    }
     let game_key = game as *mut _ as usize;
     if let Some(interval_ticks) = crate::game::bridging_assist::take_assisted_delay(game_key) {
         game.use_delay = crate::game::bridging_assist::remaining_use_delay(

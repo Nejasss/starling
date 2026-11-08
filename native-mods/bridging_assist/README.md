@@ -1,8 +1,14 @@
-# Bridging Assist for Starling — 0.4.3
+# Bridging Assist for Starling — 0.4.4
 
 A native `.hnmod` reacharound-placement implementation inspired by Bridging Mod 2.7.0 for Minecraft 26.3.
 
-## Changes in 0.4.3
+## Changes in 0.4.4
+
+- Restricts placement-preview work to Starling's visible client Game (`native_window`). Starling also dispatches `native_tick` for the server Game; the previous hook repeated world targeting and support scans there.
+- Keeps preview calculation off the server-side Game while retaining the normal client placement hook and server-authoritative placement validation.
+- Synchronizes the runtime, mixin descriptor and native manifest version strings.
+
+## Previous changes in 0.4.3
 
 - Horizontal placement now flattens the camera/player rays onto XZ and locks the target block Y to the last grounded block plane, preventing camera pitch from creating a staircase.
 - Horizontal mode forces primary-path traversal without corner/edge adjacency candidates, reducing side placements that can obstruct the player's route.

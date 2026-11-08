@@ -8,7 +8,7 @@
 use std::cell::Cell;
 
 pub const ID: &str = "bridging_assist";
-pub const VERSION: &str = "0.4.3";
+pub const VERSION: &str = "0.4.4";
 pub const DESCRIPTION: &str =
     "Reacharound placement using separate camera and player perspectives.";
 pub const KEY: &str = "toggle";
