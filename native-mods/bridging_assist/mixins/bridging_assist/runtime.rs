@@ -8,7 +8,7 @@
 use std::cell::Cell;
 
 pub const ID: &str = "bridging_assist";
-pub const VERSION: &str = "0.2.0";
+pub const VERSION: &str = "0.2.1";
 pub const DESCRIPTION: &str =
     "Reacharound placement using separate camera and player perspectives.";
 
@@ -106,18 +106,17 @@ impl Settings {
 }
 
 thread_local! {
-    /// A synthetic hit is only installed for the duration of one normal
-    /// remote_use_item_on call. RETURN injection consumes this marker and
-    /// restores tick_hit, including when the original method exits early.
-    static OVERRIDE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    /// Remembers whether the original per-tick hit was a cached MISS.
+    /// RETURN injection restores that exact state after the synthetic hit.
+    static OVERRIDE_ACTIVE: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
-pub fn arm_override() {
-    OVERRIDE_ACTIVE.with(|active| active.set(true));
+pub fn arm_override(restore_cached_miss: bool) {
+    OVERRIDE_ACTIVE.with(|active| active.set(Some(restore_cached_miss)));
 }
 
-pub fn take_override() -> bool {
-    OVERRIDE_ACTIVE.with(|active| active.replace(false))
+pub fn take_override() -> Option<bool> {
+    OVERRIDE_ACTIVE.with(|active| active.replace(None))
 }
 
 
@@ -274,6 +273,17 @@ mod tests {
 
     fn stored<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         |key| pairs.iter().find(|pair| pair.0 == key).map(|pair| pair.1.to_owned())
+    }
+
+    #[test]
+    fn override_marker_restores_cached_miss_once() {
+        arm_override(true);
+        assert_eq!(take_override(), Some(true));
+
+        arm_override(false);
+        assert_eq!(take_override(), Some(false));
+
+        assert_eq!(take_override(), None);
     }
 
     #[test]

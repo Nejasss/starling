@@ -1,8 +1,8 @@
-# Bridging Assist for Starling — 0.2.0
+# Bridging Assist for Starling — 0.2.1
 
 A first native `.hnmod` implementation of the core reacharound-placement behavior inspired by Bridging Mod 2.7.0 for Minecraft 26.3.
 
-## Included in 0.2.0
+## Included in 0.2.1
 
 - Runs only when the ordinary block raycast misses and an entity is not the target.
 - Checks for a block item in the hand currently being used.

@@ -11,7 +11,6 @@ fn bridging_assist_use_head(
         || game.sleeping.is_some()
         || game.using.is_some()
         || game.forced_hit.is_some()
-        || game.tick_hit.is_some()
         || game.entity_targeted()
         || game.pick().is_some()
         || game.aim().is_none()
@@ -166,8 +165,11 @@ fn bridging_assist_use_head(
                 cell_min[2] + 0.5 + f64::from(face[2]) * 0.5,
             ],
         };
+        // InteractionInput captures a per-tick hit before dispatching use.
+        // Preserve its cached MISS (Some(None)) across this synthetic click.
+        let restore_cached_miss = game.tick_hit.is_some();
         game.tick_hit = Some(Some(hit));
-        bridging::arm_override();
+        bridging::arm_override(restore_cached_miss);
         return;
     }
 }

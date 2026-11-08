@@ -4,8 +4,14 @@ fn bridging_assist_use_return(
     game: &mut crate::game::Game<'_>,
     value: bool,
 ) -> bool {
-    if crate::game::bridging_assist::take_override() {
-        game.tick_hit = None;
+    if let Some(restore_cached_miss) =
+        crate::game::bridging_assist::take_override()
+    {
+        game.tick_hit = if restore_cached_miss {
+            Some(None)
+        } else {
+            None
+        };
     }
     value
 }
