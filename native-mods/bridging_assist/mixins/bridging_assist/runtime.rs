@@ -8,7 +8,7 @@
 use std::cell::Cell;
 
 pub const ID: &str = "bridging_assist";
-pub const VERSION: &str = "0.4.1";
+pub const VERSION: &str = "0.4.2";
 pub const DESCRIPTION: &str =
     "Reacharound placement using separate camera and player perspectives.";
 pub const KEY: &str = "toggle";
@@ -76,14 +76,16 @@ pub struct Settings {
     pub perspective: PerspectiveMode,
     pub slab_assist: bool,
     pub post_delay_ticks: u8,
-
+    pub show_crosshair: bool,
+    pub show_outline: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
         Self { enabled: true, crouch_only: false, replace_non_solid: true, skip_torches: true,
             min_distance_percent: 20, adjacency: AdjacencyMode::Corners, snap_strength_percent: 100,
-            axis_mode: AxisMode::Both, crouch_axis_override: AxisOverride::Fallback,
-            perspective: PerspectiveMode::Auto, slab_assist: true, post_delay_ticks: 1 }
+            axis_mode: AxisMode::Horizontal, crouch_axis_override: AxisOverride::Fallback,
+            perspective: PerspectiveMode::Auto, slab_assist: true, post_delay_ticks: 3,
+            show_crosshair: true, show_outline: true }
     }
 }
 impl Settings {
@@ -97,11 +99,14 @@ impl Settings {
             min_distance_percent: number("min_distance_percent", d.min_distance_percent, 100),
             adjacency: AdjacencyMode::parse(get("adjacency"), d.adjacency),
             snap_strength_percent: number("snap_strength_percent", d.snap_strength_percent, 100),
-            axis_mode: AxisMode::parse(get("axis_mode"), d.axis_mode),
+            // Fresh keys avoid silently restoring the old BOTH/1-tick profile.
+            axis_mode: AxisMode::parse(get("placement_axes"), d.axis_mode),
             crouch_axis_override: AxisOverride::parse(get("crouch_axis_override"), d.crouch_axis_override),
             perspective: PerspectiveMode::parse(get("perspective"), d.perspective),
             slab_assist: boolean("slab_assist", d.slab_assist),
-            post_delay_ticks: number("post_delay_ticks", d.post_delay_ticks, 4),
+            post_delay_ticks: number("placement_interval_ticks", d.post_delay_ticks, 4),
+            show_crosshair: boolean("show_crosshair", d.show_crosshair),
+            show_outline: boolean("show_outline", d.show_outline),
         }
     }
     pub fn effective_axis(self, crouching: bool) -> AxisMode { if crouching { self.crouch_axis_override.resolve(self.axis_mode) } else { self.axis_mode } }
@@ -118,6 +123,8 @@ impl Settings {
             format!("Camera perspective: {}", self.perspective.as_str().to_uppercase()),
             format!("Slab assist: {}", on(self.slab_assist)),
             format!("Placement interval: {} tick(s)", self.post_delay_ticks),
+            format!("Crosshair indicator: {}", on(self.show_crosshair)),
+            format!("Placement outline: {}", on(self.show_outline)),
         ]
     }
     pub fn click(&mut self, button: usize) {
@@ -130,18 +137,21 @@ impl Settings {
             7 => self.axis_mode = self.axis_mode.next(), 8 => self.crouch_axis_override = self.crouch_axis_override.next(),
             9 => self.perspective = self.perspective.next(), 10 => self.slab_assist = !self.slab_assist,
             11 => self.post_delay_ticks = match self.post_delay_ticks { 1 => 2, 2 => 3, 3 => 4, _ => 1 },
+            12 => self.show_crosshair = !self.show_crosshair,
+            13 => self.show_outline = !self.show_outline,
             _ => {}
         }
     }
-    pub fn stored(self) -> [(&'static str, String); 12] {
+    pub fn stored(self) -> [(&'static str, String); 14] {
         let flag = |v: bool| if v { "true" } else { "false" }.to_owned();
         [
             ("enabled", flag(self.enabled)), ("crouch_only", flag(self.crouch_only)),
             ("replace_non_solid", flag(self.replace_non_solid)), ("skip_torches", flag(self.skip_torches)),
             ("min_distance_percent", self.min_distance_percent.to_string()), ("adjacency", self.adjacency.as_str().to_owned()),
-            ("snap_strength_percent", self.snap_strength_percent.to_string()), ("axis_mode", self.axis_mode.as_str().to_owned()),
+            ("snap_strength_percent", self.snap_strength_percent.to_string()), ("placement_axes", self.axis_mode.as_str().to_owned()),
             ("crouch_axis_override", self.crouch_axis_override.as_str().to_owned()), ("perspective", self.perspective.as_str().to_owned()),
-            ("slab_assist", flag(self.slab_assist)), ("post_delay_ticks", self.post_delay_ticks.to_string()),
+            ("slab_assist", flag(self.slab_assist)), ("placement_interval_ticks", self.post_delay_ticks.to_string()),
+            ("show_crosshair", flag(self.show_crosshair)), ("show_outline", flag(self.show_outline)),
         ]
     }
 }
@@ -157,6 +167,16 @@ pub fn arm_override(restore_cached_miss: bool) {
 
 pub fn take_override() -> Option<bool> {
     OVERRIDE_ACTIVE.with(|active| active.replace(None))
+}
+
+thread_local! {
+    static VISUAL_TARGET: Cell<Option<([i32; 3], [i32; 3])>> = const { Cell::new(None) };
+}
+pub fn set_visual_target(target: Option<([i32; 3], [i32; 3])>) {
+    VISUAL_TARGET.with(|value| value.set(target));
+}
+pub fn visual_target() -> Option<([i32; 3], [i32; 3])> {
+    VISUAL_TARGET.with(|value| value.get())
 }
 
 thread_local! {
@@ -485,6 +505,14 @@ mod tests {
     }
 
     #[test]
+    fn visual_target_is_shared_and_can_be_cleared() {
+        set_visual_target(Some(([4, 5, 6], [0, 1, 0])));
+        assert_eq!(visual_target(), Some(([4, 5, 6], [0, 1, 0])));
+        set_visual_target(None);
+        assert_eq!(visual_target(), None);
+    }
+
+    #[test]
     fn override_marker_restores_cached_miss_once() {
         arm_override(true);
         assert_eq!(take_override(), Some(true));
@@ -624,15 +652,17 @@ mod tests {
     }
 
     #[test]
-    fn defaults_use_one_tick_placement_interval() {
+    fn defaults_use_flat_forward_bridge_profile() {
         let settings = Settings::default();
         assert_eq!(settings.perspective, PerspectiveMode::Auto);
-        assert_eq!(settings.post_delay_ticks, 1);
+        assert_eq!(settings.post_delay_ticks, 3);
         assert_eq!(settings.adjacency, AdjacencyMode::Corners);
         assert_eq!(settings.snap_strength_percent, 100);
-        assert_eq!(settings.axis_mode, AxisMode::Both);
+        assert_eq!(settings.axis_mode, AxisMode::Horizontal);
         assert_eq!(settings.crouch_axis_override, AxisOverride::Fallback);
         assert!(settings.slab_assist);
+        assert!(settings.show_crosshair);
+        assert!(settings.show_outline);
     }
 
     #[test]

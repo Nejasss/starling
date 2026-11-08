@@ -1,0 +1,8 @@
+{
+  "game": "26.3",
+  "horizon": "ddb17da65a3e10046d4d7b1e6fa16fe1a4f8985e",
+  "id": "bridging_assist",
+  "mixins": "4342a0bfbe71d4d14185528d64e496d6022f16a1",
+  "schema": 1,
+  "version": "0.2.2"
+}

@@ -1,0 +1,104 @@
+[mod]
+id = "bridging_assist"
+version = "0.4.0"
+priority = 100
+
+# The runtime implementation is independent of the game types. The adapters
+# below use Starling's ordinary targeting and placement pipeline.
+[compatibility]
+horizon_revision = "ddb17da65a3e10046d4d7b1e6fa16fe1a4f8985e"
+
+[[module]]
+id = "runtime"
+file = "crates/horizon-client/src/game.rs"
+name = "bridging_assist"
+source = "runtime.rs"
+
+# Supply a synthetic hit only when the normal block ray misses. The original
+# remote_use_item_on path still validates, predicts, animates and sends it.
+[[injection]]
+id = "use-head"
+kind = "HEAD"
+target = "horizon_client::game::remote::Game<'_>::remote_use_item_on"
+helper = "use_head.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "hand", ty = "horizon_client::first_person::Hand", value = "hand" },
+]
+
+# Clear the temporary tick_hit on every normal return, without replacing or
+# reimplementing Starling's original bool result.
+[[injection]]
+id = "use-return"
+kind = "RETURN"
+target = "horizon_client::game::remote::Game<'_>::remote_use_item_on"
+helper = "use_return.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "value", ty = "bool", value = "$value" },
+]
+
+[[injection]]
+id = "list"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_mods"
+helper = "list.rs"
+bindings = [
+  { name = "mods", ty = "&mut Vec<crate::game::native_hooks::NativeMod>", value = "&mut *mods" },
+]
+
+[[injection]]
+id = "settings"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_settings"
+helper = "settings.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "mod_id", ty = "&str", value = "mod_id" },
+  { name = "buttons", ty = "&mut Vec<String>", value = "&mut *buttons" },
+]
+
+[[injection]]
+id = "settings-click"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_settings_click"
+helper = "settings_click.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "mod_id", ty = "&str", value = "mod_id" },
+  { name = "button", ty = "usize", value = "button" },
+]
+
+
+[[injection]]
+id = "frame-visuals"
+kind = "HEAD"
+target = "horizon_client::game::native_visuals::Game<'_>::native_frame_visuals"
+helper = "frame_visuals.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "lines", ty = "&mut Vec<horizon_client::gizmos::Line>", value = "&mut *lines" },
+]
+
+[[injection]]
+id = "crosshair"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_gui_layer_post"
+helper = "crosshair.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "layer", ty = "&str", value = "layer" },
+  { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "&mut *batch" },
+]
+
+
+[[injection]]
+id = "key"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_key"
+helper = "key.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "key", ty = "&str", value = "key" },
+  { name = "pressed", ty = "bool", value = "pressed" },
+]

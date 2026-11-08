@@ -1,6 +1,6 @@
 [mod]
 id = "bridging_assist"
-version = "0.4.1"
+version = "0.4.2"
 priority = 100
 
 # The runtime implementation is independent of the game types. The adapters
@@ -88,4 +88,27 @@ target = "horizon_client::game::native_hooks::Game<'_>::native_tick"
 helper = "use_tick.rs"
 bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+]
+
+
+# The native tick owns the shared target. Render hooks only draw that cached target.
+[[injection]]
+id = "frame-visuals"
+kind = "HEAD"
+target = "horizon_client::game::native_visuals::Game<'_>::native_frame_visuals"
+helper = "frame_visuals.rs"
+bindings = [
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "lines", ty = "&mut Vec<horizon_client::gizmos::Line>", value = "&mut *lines" },
+]
+
+[[injection]]
+id = "crosshair"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_gui_layer_post"
+helper = "crosshair.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "layer", ty = "&str", value = "layer" },
+  { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "&mut *batch" },
 ]

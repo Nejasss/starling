@@ -1,8 +1,15 @@
-# Bridging Assist for Starling — 0.4.1
+# Bridging Assist for Starling — 0.4.2
 
 A native `.hnmod` reacharound-placement implementation inspired by Bridging Mod 2.7.0 for Minecraft 26.3.
 
-## Changes in 0.4.1
+## Changes in 0.4.2
+
+- Restores the directional crosshair marker around the vanilla reticle and restores the target-block outline.
+- Computes one valid candidate per client tick and shares it between placement, crosshair and outline. The outline hook only draws the cached box; it does not scan the world every rendered frame.
+- Uses horizontal-only placement axes and a three-tick placement interval by default for steadier forward sprint-bridging. Both remain configurable in Options > Mods.
+- Revalidates the cached target, support block and Adventure-mode placement permission immediately before use.
+
+## Previous changes in 0.4.1
 
 - Removes the improvised crosshair marker and custom placement-outline renderer. Starling's ordinary crosshair and block highlight remain untouched.
 - Removes candidate-path and block-support scanning from the per-frame visual hook; the mod no longer performs its own world traversal every rendered frame.
@@ -12,7 +19,7 @@ A native `.hnmod` reacharound-placement implementation inspired by Bridging Mod 
 
 ## Known limitations
 
-This remains a best-effort native port, not feature-identical parity. Still not ported: polished sprite crosshair, action-bar-style toggle notification, non-bridging outline and F3 debug trace modes, extension API and Sable/Dank Storage integrations, and automatic FreeLook detection (Auto currently uses the active camera). Numeric sliders remain coarse menu presets. Real in-game regression testing is still required for sprint-forward/reverse/sideways bridging, first/third-person camera, touch/controller, moving platforms, server-authority, slabs and trapdoors. The one-tick interval is a client request cadence; servers may reject or throttle overly rapid placements.
+This remains a best-effort native port, not feature-identical parity. Still not ported: polished sprite crosshair, action-bar-style toggle notification, non-bridging outline and F3 debug trace modes, extension API and Sable/Dank Storage integrations, and automatic FreeLook detection (Auto currently uses the active camera). Numeric sliders remain coarse menu presets. Real in-game regression testing is still required for sprint-forward/reverse/sideways bridging, first/third-person camera, touch/controller, moving platforms, server-authority, slabs and trapdoors. The placement interval is a client request cadence; servers may reject or throttle overly rapid placements.
 
 ## Build
 
