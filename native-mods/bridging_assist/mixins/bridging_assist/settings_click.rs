@@ -4,7 +4,7 @@ fn bridging_assist_settings_click(
     button: usize,
 ) {
     use crate::game::bridging_assist as bridging;
-    if mod_id != bridging::ID || button >= 5 {
+    if mod_id != bridging::ID || button >= 14 {
         return;
     }
     let mut settings = bridging::Settings::read(|key| game.native_setting(bridging::ID, key));

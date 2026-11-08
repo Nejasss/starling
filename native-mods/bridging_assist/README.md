@@ -1,8 +1,8 @@
-# Bridging Assist for Starling — 0.2.2
+# Bridging Assist for Starling — 0.4.0
 
 A first native `.hnmod` implementation of the core reacharound-placement behavior inspired by Bridging Mod 2.7.0 for Minecraft 26.3.
 
-## Included in 0.2.2
+## Included in 0.4.0
 
 - Runs only when the ordinary block raycast misses and an entity is not the target.
 - Checks for a block item in the hand currently being used.
@@ -12,13 +12,19 @@ A first native `.hnmod` implementation of the core reacharound-placement behavio
 - Checks for a non-air, non-replaceable support block behind the candidate.
 - Reuses Starling's ordinary `remote_use_item_on` path for packet creation, prediction, hand animation and server validation.
 - Converts the support-side direction to the opposite hit face used by Bridging Mod's default placement target.
-- Converts the support-side direction to the opposite hit face used by Bridging Mod's default placement target.
+- Expands the Bresenham path with edge/corner candidates using a segment-versus-voxel snap test.
+- Adds configurable adjacency, snap strength, horizontal/vertical axis filters and crouch axis override.
+- Adds Camera / Eyeline perspective selection; Auto currently falls back to Camera because Starling has no FreeLook compatibility registry for this mod.
+- Adds vanilla slab and trapdoor hit-point assist, plus compatible vertical-slab merging.
+- Applies the configurable post-placement delay (default: 4 ticks).
+- Adds a placement outline, a simple directional marker below the crosshair, and a configurable comma-default toggle key with chat feedback.
+- Keeps Starling's ordinary use-item placement path for prediction, packets, animation and server validation.
 - Exposes settings for enablement, crouch-only, replacing non-solid targets, torch skipping and minimum bridge distance.
 - Uses a RETURN hook to restore the temporary hit after the original interaction path returns.
 
 ## Not yet included
 
-This is still a staged native port, not a complete reproduction of the Fabric mod. The reacharound candidate path and hit orientation are closer to the upstream algorithm, but the crosshair direction indicator, placement outline, slab assist, special item/environment handlers, perspective modes, snap strength, adjacency modes, and full distance/axis tuning are not yet implemented. First-person, touch, detached-camera, replaceable-block, and slab edge cases still require in-game testing.
+This is a best-effort native port, not byte-for-byte or feature-identical parity. Still not ported: polished sprite crosshair and action-bar-style toggle notification, non-bridging outline and F3 debug trace modes, the extension API and its Sable/Dank Storage integrations, and automatic FreeLook detection (Auto currently uses the active camera). Numeric sliders are exposed as coarse menu presets rather than the upstream continuous controls. First-person, touch/controller, detached-camera, moving-platform, server-authority, slab/trapdoor and sprint-forward behavior still require real in-game regression testing before calling the port complete.
 
 ## Build
 
