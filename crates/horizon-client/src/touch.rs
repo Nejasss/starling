@@ -152,6 +152,8 @@ pub enum Interact {
     #[default]
     Tap,
     Crosshair,
+    /// The view only turns the camera; Attack and Use buttons are the only world actions.
+    ButtonsOnly,
 }
 
 impl Interact {
@@ -160,10 +162,11 @@ impl Interact {
         match self {
             Interact::Tap => "tap",
             Interact::Crosshair => "crosshair",
+            Interact::ButtonsOnly => "buttons",
         }
     }
     fn from_id(id: &str) -> Option<Self> {
-        [Interact::Tap, Interact::Crosshair]
+        [Interact::Tap, Interact::Crosshair, Interact::ButtonsOnly]
             .into_iter()
             .find(|i| i.id() == id)
     }
@@ -173,12 +176,14 @@ impl Interact {
         match self {
             Interact::Tap => "Touch",
             Interact::Crosshair => "Aim",
+            Interact::ButtonsOnly => "Buttons",
         }
     }
     fn next(self) -> Self {
         match self {
             Interact::Tap => Interact::Crosshair,
-            Interact::Crosshair => Interact::Tap,
+            Interact::Crosshair => Interact::ButtonsOnly,
+            Interact::ButtonsOnly => Interact::Tap,
         }
     }
 }
@@ -650,7 +655,7 @@ impl LayoutConfig {
 
     /// Whether `button` is part of the controls in this interaction mode.
     pub fn offers(&self, button: Button) -> bool {
-        self.interact == Interact::Crosshair || !button.aims()
+        self.interact != Interact::Tap || !button.aims()
     }
 
     /// How opaque a control is drawn while playing: 0 for a ghost.
@@ -729,6 +734,8 @@ pub struct Layout {
     pub dpad: bool,
     /// Taps and presses on the view act on what is under the finger ([`Interact::Tap`]).
     pub tap: bool,
+    /// Whether touching the view may trigger a world action (false in ButtonsOnly mode).
+    pub view_interaction: bool,
     /// The buttons that work: centre, radius, and how opaque they are drawn (0 for a ghost).
     pub buttons: Vec<(Button, [f32; 2], f32, f32)>,
     /// The mods' buttons that work, the same way: their index in [`LayoutConfig::extra`], and
@@ -766,6 +773,7 @@ impl Layout {
             stick_alpha: config.alpha(&config.stick),
             dpad: config.dpad == Some(true),
             tap: config.interact == Interact::Tap,
+            view_interaction: config.interact != Interact::ButtonsOnly,
             buttons: config
                 .buttons
                 .iter()
@@ -954,6 +962,8 @@ enum Role {
         dragged: bool,
         /// Held still past [`HOLD`]: breaking (or using) until it lifts.
         holding: bool,
+        /// False for ButtonsOnly: this finger may turn the view, but never act on the world.
+        interact: bool,
     },
     Button(Button, Instant),
     /// A finger on the D-pad: the cell it is on (None off the pad) and whether it sprints.
@@ -1134,6 +1144,7 @@ impl TouchControls {
                         down: now,
                         dragged: false,
                         holding: false,
+                        interact: layout.view_interaction,
                     }
                 };
                 self.fingers.retain(|(f, _)| *f != id);
@@ -1258,11 +1269,12 @@ impl TouchControls {
                 down,
                 dragged,
                 holding,
+                interact,
                 ..
             } => {
-                if holding {
+                if interact && holding {
                     vec![Action::HoldStop]
-                } else if ended && !dragged && now - down < HOLD {
+                } else if interact && ended && !dragged && now - down < HOLD {
                     vec![Action::Tap(last)]
                 } else {
                     Vec::new()
@@ -1303,6 +1315,7 @@ impl TouchControls {
                 down,
                 dragged: false,
                 holding,
+                interact: true,
                 ..
             } = role
                 && !*holding
@@ -1323,6 +1336,7 @@ impl TouchControls {
                 last,
                 dragged,
                 holding,
+                interact: true,
                 ..
             } if !*dragged || *holding => Some(*last),
             _ => None,
@@ -1331,9 +1345,16 @@ impl TouchControls {
 
     /// Whether a finger on the view holds (breaks or uses) now.
     pub fn holding(&self) -> bool {
-        self.fingers
-            .iter()
-            .any(|(_, r)| matches!(r, Role::Look { holding: true, .. }))
+        self.fingers.iter().any(|(_, r)| {
+            matches!(
+                r,
+                Role::Look {
+                    holding: true,
+                    interact: true,
+                    ..
+                }
+            )
+        })
     }
 
     /// Lift every finger (a menu opened, the app went to the background).
@@ -2299,6 +2320,10 @@ mod tests {
         assert_eq!(config.interact, Interact::Crosshair);
         assert!(has_use(&config));
         editor.event(&mut config, w, h, 11, TouchPhase::Started, interact);
+        assert_eq!(config.interact, Interact::ButtonsOnly);
+        assert!(has_use(&config));
+        assert_eq!(LayoutConfig::from_json(&config.to_json()), config);
+        editor.event(&mut config, w, h, 12, TouchPhase::Started, interact);
         assert_eq!(config.interact, Interact::Tap);
         let reset = bar(EditorAction::Reset);
         assert_eq!(
@@ -2589,6 +2614,87 @@ mod tests {
         t.event(&l, 2, TouchPhase::Ended, [2500.0, 500.0], now + HOLD);
         assert_eq!(t.aim(), None);
         assert!(!t.holding());
+    }
+
+    #[test]
+    fn buttons_only_keeps_view_touch_for_look_and_requires_attack_or_use_buttons() {
+        let (w, h) = (3200.0, 1440.0);
+        let config = LayoutConfig {
+            interact: Interact::ButtonsOnly,
+            ..LayoutConfig::default()
+        };
+        let layout = Layout::from_config(&config, w, h, 6.0);
+        assert!(!layout.tap);
+        assert!(!layout.view_interaction);
+        assert_eq!(LayoutConfig::from_json(&config.to_json()), config);
+        for button in [Button::Attack, Button::Use] {
+            assert!(layout.buttons.iter().any(|(b, ..)| *b == button));
+        }
+
+        let at = |button: Button| {
+            layout
+                .buttons
+                .iter()
+                .find(|(b, ..)| *b == button)
+                .unwrap()
+                .1
+        };
+        let now = Instant::now();
+        let mut controls = TouchControls::default();
+
+        // Explicit Attack and Use controls still press and release their triggers.
+        let attack = at(Button::Attack);
+        assert_eq!(
+            controls.event(&layout, 1, TouchPhase::Started, attack, now),
+            vec![Action::Press(Button::Attack)]
+        );
+        assert_eq!(
+            controls.event(&layout, 1, TouchPhase::Ended, attack, now),
+            vec![Action::Release(Button::Attack)]
+        );
+        let use_button = at(Button::Use);
+        assert_eq!(
+            controls.event(&layout, 2, TouchPhase::Started, use_button, now),
+            vec![Action::Press(Button::Use)]
+        );
+        assert_eq!(
+            controls.event(&layout, 2, TouchPhase::Ended, use_button, now),
+            vec![Action::Release(Button::Use)]
+        );
+
+        // A quick tap in the world and a stationary long press must not attack, use or break.
+        let view = [2000.0, 500.0];
+        assert!(
+            controls
+                .event(&layout, 3, TouchPhase::Started, view, now)
+                .is_empty()
+        );
+        assert!(
+            controls
+                .event(&layout, 3, TouchPhase::Ended, view, now)
+                .is_empty()
+        );
+        assert!(
+            controls
+                .event(&layout, 4, TouchPhase::Started, view, now)
+                .is_empty()
+        );
+        assert!(controls.frame(now + HOLD).is_empty());
+        assert!(!controls.holding());
+        assert_eq!(controls.aim(), None);
+
+        // Dragging on the same area continues to turn the camera.
+        assert!(matches!(
+            controls
+                .event(&layout, 4, TouchPhase::Moved, [2060.0, 520.0], now + HOLD)
+                .as_slice(),
+            [Action::Look(..)]
+        ));
+        assert!(
+            controls
+                .event(&layout, 4, TouchPhase::Ended, [2060.0, 520.0], now + HOLD)
+                .is_empty()
+        );
     }
 
     #[test]

@@ -29,7 +29,7 @@ on:
       native_mods:
         description: A test with these native mods of native-mods/ compiled in (ids, separated by spaces), by native_build.sh
         type: string
-        default: ''
+        default: 'accurate_block_placement coords_hud veinminer waymap waypoints zoom'
 permissions:
   contents: read
 env:
@@ -124,6 +124,18 @@ jobs:
             bundles+=("native-mods/$id/mixins/$id")
           done
           bash packaging/android/native_build.sh . "$RUNNER_TEMP/native" "${bundles[@]}"
+          # Fail the build if a requested bundle (especially VeinMiner) was not recorded in
+          # the native build manifest. This prevents publishing a misleading APK artifact.
+          python3 - "$RUNNER_TEMP/native/build.json" "$MODS" <<'PY'
+          import json, sys
+          info = json.load(open(sys.argv[1], encoding="utf-8"))
+          requested = set(sys.argv[2].split())
+          compiled = {entry["id"] for entry in info.get("mods", [])}
+          missing = sorted(requested - compiled)
+          if missing or "veinminer" not in compiled:
+              raise SystemExit("Native APK is missing requested mods: " + ", ".join(missing or ["veinminer"]))
+          print("Verified native mods: " + ", ".join(sorted(compiled)))
+          PY
           mkdir -p target/android
           for apk in "$RUNNER_TEMP"/native/starling-*.apk; do
             cp "$apk" "target/android/$(basename "${apk%.apk}")-$(echo $MODS | tr ' ' '-').apk"
