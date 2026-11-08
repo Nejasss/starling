@@ -25,7 +25,7 @@ fn bridging_assist_use_tick(game: &mut crate::game::Game<'_>) {
         return;
     }
 
-    let settings = bridging::Settings::read(|key| game.native_setting(bridging::ID, key));
+    let settings = bridging::cached_settings(game);
     let crouching = game.player.as_ref().is_some_and(|player| player.local_crouching)
         || game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft)
         || game.keys.contains(&winit::keyboard::KeyCode::ShiftRight);

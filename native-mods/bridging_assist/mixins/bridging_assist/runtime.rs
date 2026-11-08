@@ -8,7 +8,7 @@
 use std::cell::Cell;
 
 pub const ID: &str = "bridging_assist";
-pub const VERSION: &str = "0.4.4";
+pub const VERSION: &str = "0.4.5";
 pub const DESCRIPTION: &str =
     "Reacharound placement using separate camera and player perspectives.";
 pub const KEY: &str = "toggle";
@@ -155,6 +155,34 @@ impl Settings {
         ]
     }
 }
+thread_local! {
+    /// Parsed settings are loaded from native-data once and reused by tick and
+    /// render hooks. The settings page refreshes this snapshot when it opens
+    /// and after each option click.
+    static SETTINGS_CACHE: Cell<Option<Settings>> = const { Cell::new(None) };
+}
+
+pub fn cached_settings(game: &crate::game::Game<'_>) -> Settings {
+    SETTINGS_CACHE.with(|cache| match cache.get() {
+        Some(settings) => settings,
+        None => {
+            let settings = Settings::read(|key| game.native_setting(ID, key));
+            cache.set(Some(settings));
+            settings
+        }
+    })
+}
+
+pub fn cache_settings(settings: Settings) {
+    SETTINGS_CACHE.with(|cache| cache.set(Some(settings)));
+}
+
+pub fn reload_settings(game: &crate::game::Game<'_>) -> Settings {
+    let settings = Settings::read(|key| game.native_setting(ID, key));
+    cache_settings(settings);
+    settings
+}
+
 thread_local! {
     /// Remembers whether the original per-tick hit was a cached MISS.
     /// RETURN injection restores that exact state after the synthetic hit.

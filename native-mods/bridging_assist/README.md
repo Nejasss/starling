@@ -1,6 +1,12 @@
-# Bridging Assist for Starling — 0.4.4
+# Bridging Assist for Starling — 0.4.5
 
 A native `.hnmod` reacharound-placement implementation inspired by Bridging Mod 2.7.0 for Minecraft 26.3.
+
+## Changes in 0.4.5
+
+- Caches the parsed settings snapshot on the client game thread. Starling's `native_setting` reads one file per key, so repeated reads from every tick and render hook caused unnecessary storage I/O.
+- Refreshes the cache when the native settings page opens or an option is clicked; tick, placement, crosshair and outline hooks reuse the in-memory snapshot.
+- Removes per-frame file reads for the crosshair and outline flags and per-tick file reads for all 14 settings.
 
 ## Changes in 0.4.4
 

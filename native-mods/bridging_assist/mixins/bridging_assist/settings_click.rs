@@ -7,8 +7,9 @@ fn bridging_assist_settings_click(
     if mod_id != bridging::ID || button >= 14 {
         return;
     }
-    let mut settings = bridging::Settings::read(|key| game.native_setting(bridging::ID, key));
+    let mut settings = bridging::cached_settings(game);
     settings.click(button);
+    bridging::cache_settings(settings);
     for (key, value) in settings.stored() {
         game.native_set_setting(bridging::ID, key, &value);
     }

@@ -8,11 +8,9 @@ fn bridging_assist_crosshair(
     if layer != "minecraft:crosshair" || !game.native_on(bridging::ID) {
         return;
     }
-    // Keep the render hook cheap: the full mod settings snapshot is not needed
-    // just to decide whether the center indicator should be drawn.
-    let enabled = game.native_setting(bridging::ID, "enabled").is_none_or(|v| v.trim() != "false");
-    let show_crosshair = game.native_setting(bridging::ID, "show_crosshair").is_none_or(|v| v.trim() != "false");
-    if !enabled || !show_crosshair {
+    // Reuse the parsed snapshot: native_setting reads a file from disk.
+    let settings = bridging::cached_settings(game);
+    if !settings.enabled || !settings.show_crosshair {
         return;
     }
     let Some((_, face)) = bridging::visual_target() else { return; };

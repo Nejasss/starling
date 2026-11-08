@@ -7,11 +7,9 @@ fn bridging_assist_frame_visuals(
     if !game.native_on(bridging::ID) || game.screen != crate::game::Screen::Playing {
         return;
     }
-    // Read only the two flags needed during rendering; Settings::read would
-    // allocate and parse every persisted option on every rendered frame.
-    let enabled = game.native_setting(bridging::ID, "enabled").is_none_or(|v| v.trim() != "false");
-    let show_outline = game.native_setting(bridging::ID, "show_outline").is_none_or(|v| v.trim() != "false");
-    if !enabled || !show_outline {
+    // Reuse the parsed snapshot: native_setting reads a file from disk.
+    let settings = bridging::cached_settings(game);
+    if !settings.enabled || !settings.show_outline {
         return;
     }
     let Some((pos, _)) = bridging::visual_target() else { return; };

@@ -7,6 +7,6 @@ fn bridging_assist_settings(
     if mod_id != bridging::ID {
         return;
     }
-    let settings = bridging::Settings::read(|key| game.native_setting(bridging::ID, key));
+    let settings = bridging::reload_settings(game);
     buttons.extend(settings.labels());
 }
