@@ -6,7 +6,10 @@ fn bridging_assist_use_return(game: &mut crate::game::Game<'_>, value: bool) -> 
         game.tick_hit = if restore_cached_miss { Some(None) } else { None };
         if value {
             let settings = crate::game::bridging_assist::Settings::read(|key| game.native_setting(crate::game::bridging_assist::ID, key));
-            game.use_delay = game.use_delay.max(u32::from(settings.post_delay_ticks));
+            crate::game::bridging_assist::arm_assisted_delay(
+                game as *mut _ as usize,
+                settings.post_delay_ticks,
+            );
         }
     }
     value

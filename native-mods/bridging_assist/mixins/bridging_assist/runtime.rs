@@ -8,7 +8,7 @@
 use std::cell::Cell;
 
 pub const ID: &str = "bridging_assist";
-pub const VERSION: &str = "0.4.0";
+pub const VERSION: &str = "0.4.1";
 pub const DESCRIPTION: &str =
     "Reacharound placement using separate camera and player perspectives.";
 pub const KEY: &str = "toggle";
@@ -76,16 +76,14 @@ pub struct Settings {
     pub perspective: PerspectiveMode,
     pub slab_assist: bool,
     pub post_delay_ticks: u8,
-    pub show_crosshair: bool,
-    pub show_outline: bool,
+
 }
 impl Default for Settings {
     fn default() -> Self {
         Self { enabled: true, crouch_only: false, replace_non_solid: true, skip_torches: true,
             min_distance_percent: 20, adjacency: AdjacencyMode::Corners, snap_strength_percent: 100,
             axis_mode: AxisMode::Both, crouch_axis_override: AxisOverride::Fallback,
-            perspective: PerspectiveMode::Auto, slab_assist: true, post_delay_ticks: 4,
-            show_crosshair: true, show_outline: true }
+            perspective: PerspectiveMode::Auto, slab_assist: true, post_delay_ticks: 1 }
     }
 }
 impl Settings {
@@ -103,8 +101,7 @@ impl Settings {
             crouch_axis_override: AxisOverride::parse(get("crouch_axis_override"), d.crouch_axis_override),
             perspective: PerspectiveMode::parse(get("perspective"), d.perspective),
             slab_assist: boolean("slab_assist", d.slab_assist),
-            post_delay_ticks: number("post_delay_ticks", d.post_delay_ticks, 20),
-            show_crosshair: boolean("show_crosshair", d.show_crosshair), show_outline: boolean("show_outline", d.show_outline),
+            post_delay_ticks: number("post_delay_ticks", d.post_delay_ticks, 4),
         }
     }
     pub fn effective_axis(self, crouching: bool) -> AxisMode { if crouching { self.crouch_axis_override.resolve(self.axis_mode) } else { self.axis_mode } }
@@ -120,8 +117,7 @@ impl Settings {
             format!("Crouch axis override: {}", self.crouch_axis_override.as_str().to_uppercase()),
             format!("Camera perspective: {}", self.perspective.as_str().to_uppercase()),
             format!("Slab assist: {}", on(self.slab_assist)),
-            format!("Post-placement delay: {} ticks", self.post_delay_ticks),
-            format!("Crosshair indicator: {}", on(self.show_crosshair)), format!("Placement outline: {}", on(self.show_outline)),
+            format!("Placement interval: {} tick(s)", self.post_delay_ticks),
         ]
     }
     pub fn click(&mut self, button: usize) {
@@ -133,11 +129,11 @@ impl Settings {
             6 => self.snap_strength_percent = match self.snap_strength_percent { 0 => 25, 25 => 50, 50 => 75, 75 => 100, _ => 0 },
             7 => self.axis_mode = self.axis_mode.next(), 8 => self.crouch_axis_override = self.crouch_axis_override.next(),
             9 => self.perspective = self.perspective.next(), 10 => self.slab_assist = !self.slab_assist,
-            11 => self.post_delay_ticks = match self.post_delay_ticks { 0 => 1, 1 => 2, 2 => 3, 3 => 4, 4 => 6, 6 => 8, 8 => 10, 10 => 20, _ => 0 },
-            12 => self.show_crosshair = !self.show_crosshair, 13 => self.show_outline = !self.show_outline, _ => {}
+            11 => self.post_delay_ticks = match self.post_delay_ticks { 1 => 2, 2 => 3, 3 => 4, _ => 1 },
+            _ => {}
         }
     }
-    pub fn stored(self) -> [(&'static str, String); 14] {
+    pub fn stored(self) -> [(&'static str, String); 12] {
         let flag = |v: bool| if v { "true" } else { "false" }.to_owned();
         [
             ("enabled", flag(self.enabled)), ("crouch_only", flag(self.crouch_only)),
@@ -146,7 +142,6 @@ impl Settings {
             ("snap_strength_percent", self.snap_strength_percent.to_string()), ("axis_mode", self.axis_mode.as_str().to_owned()),
             ("crouch_axis_override", self.crouch_axis_override.as_str().to_owned()), ("perspective", self.perspective.as_str().to_owned()),
             ("slab_assist", flag(self.slab_assist)), ("post_delay_ticks", self.post_delay_ticks.to_string()),
-            ("show_crosshair", flag(self.show_crosshair)), ("show_outline", flag(self.show_outline)),
         ]
     }
 }
@@ -165,11 +160,34 @@ pub fn take_override() -> Option<bool> {
 }
 
 thread_local! {
-    static VISUAL_TARGET: Cell<Option<([i32; 3], [i32; 3])>> = const { Cell::new(None) };
+    static PENDING_ASSISTED_DELAY: Cell<Option<(usize, u8)>> = const { Cell::new(None) };
+}
+
+pub fn arm_assisted_delay(game_key: usize, interval_ticks: u8) {
+    PENDING_ASSISTED_DELAY.with(|pending| pending.set(Some((game_key, interval_ticks))));
+}
+
+pub fn take_assisted_delay(game_key: usize) -> Option<u8> {
+    PENDING_ASSISTED_DELAY.with(|pending| match pending.get() {
+        Some((key, ticks)) if key == game_key => {
+            pending.set(None);
+            Some(ticks)
+        }
+        _ => None,
+    })
+}
+
+/// Starling decrements use_delay before native_tick, while its held-use loop
+/// writes a hard-coded four ticks after the assisted interaction returns.
+/// Convert the requested interval to the remaining delay for the next tick.
+pub fn remaining_use_delay(current: u32, interval_ticks: u8) -> u32 {
+    current.min(u32::from(interval_ticks.saturating_sub(1)))
+}
+
+
+thread_local! {
     static LAST_GROUNDED_Y_FRAC: Cell<f64> = const { Cell::new(0.0) };
 }
-pub fn set_visual_target(target: Option<([i32; 3], [i32; 3])>) { VISUAL_TARGET.with(|value| value.set(target)); }
-pub fn visual_target() -> Option<([i32; 3], [i32; 3])> { VISUAL_TARGET.with(|value| value.get()) }
 pub fn remember_grounded_y_fraction(y: f64, on_ground: bool) { if on_ground && y.is_finite() { LAST_GROUNDED_Y_FRAC.with(|value| value.set(y.rem_euclid(1.0))); } }
 pub fn last_grounded_y_fraction() -> f64 { LAST_GROUNDED_Y_FRAC.with(|value| value.get()) }
 
@@ -606,15 +624,15 @@ mod tests {
     }
 
     #[test]
-    fn perspective_and_delay_defaults_match_upstream() {
+    fn defaults_use_one_tick_placement_interval() {
         let settings = Settings::default();
         assert_eq!(settings.perspective, PerspectiveMode::Auto);
-        assert_eq!(settings.post_delay_ticks, 4);
+        assert_eq!(settings.post_delay_ticks, 1);
         assert_eq!(settings.adjacency, AdjacencyMode::Corners);
         assert_eq!(settings.snap_strength_percent, 100);
         assert_eq!(settings.axis_mode, AxisMode::Both);
         assert_eq!(settings.crouch_axis_override, AxisOverride::Fallback);
-        assert!(settings.slab_assist && settings.show_crosshair && settings.show_outline);
+        assert!(settings.slab_assist);
     }
 
     #[test]
@@ -625,6 +643,16 @@ mod tests {
             5.0, 0, AdjacencyMode::Disabled, 100,
         ).unwrap();
         assert_eq!(path.first(), Some(&[0, 5, 0]));
+    }
+
+
+    #[test]
+    fn assisted_interval_maps_to_remaining_starling_delay() {
+        assert_eq!(remaining_use_delay(3, 1), 0);
+        assert_eq!(remaining_use_delay(3, 2), 1);
+        assert_eq!(remaining_use_delay(3, 3), 2);
+        assert_eq!(remaining_use_delay(3, 4), 3);
+        assert_eq!(remaining_use_delay(1, 4), 1);
     }
 
 }
