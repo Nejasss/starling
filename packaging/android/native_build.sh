@@ -100,6 +100,18 @@ git -C "$source" show "HEAD:$manifest" > "$work/manifest"
 cmp -s "$work/manifest" "$build/$manifest" || cp "$work/manifest" "$build/$manifest"
 
 rm -f "$build"/target/android/starling-*.apk
+
+# Reuse the persistent signing key supplied by the Android workflow.
+if [ -z "${HORIZON_ANDROID_KEYSTORE:-}" ]; then
+  key="$source/target/android/debug.keystore"
+  [ -f "$key" ] || fail "persistent debug keystore is missing: $key"
+  mkdir -p "$build/target/android"
+  cp "$key" "$build/target/android/debug.keystore"
+else
+  [ -f "$HORIZON_ANDROID_KEYSTORE" ] ||
+    fail "configured signing keystore is missing"
+fi
+
 # NATIVE_LIBRARY_ONLY: the library is all the game downloads, and the APK takes time to make.
 (cd "$build" && python3 packaging/android/build_apk.py --profile "$profile" \
   ${NATIVE_LIBRARY_ONLY:+--library-only})
