@@ -610,7 +610,8 @@ impl Game<'_> {
                 .registry
                 .state(state)
                 .map(|s| s.properties.clone())
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .into(),
             block_entity: facts.block_entity || data.is_some(),
             hardness: facts.hardness,
             item: (&*facts.item != "minecraft:air").then(|| facts.item.to_string()),
