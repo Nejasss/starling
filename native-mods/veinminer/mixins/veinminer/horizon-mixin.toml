@@ -1,6 +1,6 @@
 [mod]
 id = "veinminer"
-version = "0.3.2"
+version = "0.4.0"
 priority = 100
 
 [compatibility]

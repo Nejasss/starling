@@ -8,6 +8,28 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 pub type Position = [i32; 3];
 pub type Actor = [i32; 4];
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Shape {
+    #[default]
+    Shapeless,
+    Tunnel,
+    ThreeByThree,
+    StaircaseUp,
+    StaircaseDown,
+}
+impl Shape {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Shapeless => "Shapeless",
+            Self::Tunnel => "Tunnel",
+            Self::ThreeByThree => "3x3",
+            Self::StaircaseUp => "Staircase Up",
+            Self::StaircaseDown => "Staircase Down",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Settings {
@@ -21,6 +43,9 @@ pub struct Settings {
     pub hunger_per_block: f32,
     pub separate_group_mining: bool,
     pub permission_restricted: bool,
+    pub shape: Shape,
+    pub match_families: bool,
+    pub match_crop_maturity: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -35,6 +60,9 @@ impl Default for Settings {
             hunger_per_block: 0.0,
             separate_group_mining: false,
             permission_restricted: false,
+            shape: Shape::Shapeless,
+            match_families: true,
+            match_crop_maturity: true,
         }
     }
 }
@@ -192,11 +220,16 @@ impl Default for Config {
         ] {
             groups.push(Group {
                 id: format!("{ore}-ore"),
-                blocks: [
-                    format!("minecraft:{ore}_ore"),
-                    format!("minecraft:deepslate_{ore}_ore"),
-                ]
-                .into(),
+                blocks: {
+                    let mut blocks = BTreeSet::from([
+                        format!("minecraft:{ore}_ore"),
+                        format!("minecraft:deepslate_{ore}_ore"),
+                    ]);
+                    if matches!(ore, "iron" | "gold" | "copper") {
+                        blocks.insert(format!("minecraft:raw_{ore}_block"));
+                    }
+                    blocks
+                },
                 tools: BTreeSet::new(),
                 overrides: Overrides::default(),
             });
@@ -235,6 +268,8 @@ pub struct Block {
     pub name: String,
     pub state: u32,
     pub breakable: bool,
+    pub plant: bool,
+    pub growth: Option<(u32, u32)>,
 }
 #[derive(Clone, Debug)]
 pub struct Player {
@@ -275,16 +310,204 @@ pub struct Report {
     pub stopped: bool,
 }
 
+fn block_family(name: &str) -> Option<String> {
+    let path = name.strip_prefix("minecraft:")?;
+    for metal in ["iron", "gold", "copper"] {
+        if path == format!("{metal}_ore")
+            || path == format!("deepslate_{metal}_ore")
+            || path == format!("raw_{metal}_block")
+        {
+            return Some(format!("metal:{metal}"));
+        }
+    }
+    if let Some(ore) = path.strip_prefix("deepslate_") {
+        if ore.ends_with("_ore") {
+            return Some(format!("ore:{ore}"));
+        }
+    }
+    path.ends_with("_ore").then(|| format!("ore:{path}"))
+}
+
+fn same_crop_maturity(origin: &Block, candidate: &Block, settings: &Settings) -> bool {
+    if !settings.match_crop_maturity || origin.name != candidate.name {
+        return true;
+    }
+    match (origin.growth, candidate.growth) {
+        (Some((age_a, max_a)), Some((age_b, max_b))) => {
+            (age_a >= max_a) == (age_b >= max_b)
+        }
+        _ => true,
+    }
+}
+
+fn same_shapeless_family(
+    origin: &Block,
+    candidate: &Block,
+    targets: &BTreeSet<String>,
+    settings: &Settings,
+) -> bool {
+    if origin.name == candidate.name || targets.contains(&candidate.name) {
+        return same_crop_maturity(origin, candidate, settings);
+    }
+    if !settings.match_families {
+        return false;
+    }
+    if origin.plant && candidate.plant {
+        return true;
+    }
+    matches!((block_family(&origin.name), block_family(&candidate.name)), (Some(a), Some(b)) if a == b)
+}
+
+fn face_axis(face: Position) -> Position {
+    let axis = (0..3).max_by_key(|i| face[*i].abs()).unwrap_or(2);
+    if face[axis] == 0 {
+        [0, 0, 1]
+    } else {
+        let mut direction = [0, 0, 0];
+        direction[axis] = face[axis].signum();
+        direction
+    }
+}
+
+fn add_offset(
+    origin: Position,
+    forward: Position,
+    distance: i32,
+    lateral: Position,
+    width: i32,
+    vertical: Position,
+) -> Option<Position> {
+    let mut result = origin;
+    for axis in 0..3 {
+        let step = forward[axis]
+            .checked_mul(distance)?
+            .checked_add(lateral[axis].checked_mul(width)?)?
+            .checked_add(vertical[axis])?;
+        result[axis] = result[axis].checked_add(step)?;
+    }
+    Some(result)
+}
+
+fn push_position(output: &mut Vec<Position>, seen: &mut BTreeSet<Position>, p: Option<Position>, limit: usize) {
+    if output.len() >= limit {
+        return;
+    }
+    if let Some(p) = p {
+        if seen.insert(p) {
+            output.push(p);
+        }
+    }
+}
+
+fn geometric_positions(origin: Position, face: Position, shape: Shape, limit: usize) -> Vec<Position> {
+    let mut output = Vec::with_capacity(limit.min(256));
+    let mut seen = BTreeSet::new();
+    push_position(&mut output, &mut seen, Some(origin), limit);
+    if limit <= 1 {
+        return output;
+    }
+    let normal = face_axis(face);
+    match shape {
+        Shape::Shapeless => {}
+        Shape::ThreeByThree => {
+            let (u, v) = if normal[0] != 0 {
+                ([0, 1, 0], [0, 0, 1])
+            } else if normal[1] != 0 {
+                ([1, 0, 0], [0, 0, 1])
+            } else {
+                ([1, 0, 0], [0, 1, 0])
+            };
+            for (a, b) in [(0, -1), (0, 1), (-1, 0), (1, 0), (-1, -1), (-1, 1), (1, -1), (1, 1)] {
+                let mut p = origin;
+                let mut valid = true;
+                for axis in 0..3 {
+                    let Some(value) = p[axis]
+                        .checked_add(u[axis] * a)
+                        .and_then(|n| n.checked_add(v[axis] * b)) else {
+                        valid = false;
+                        break;
+                    };
+                    p[axis] = value;
+                }
+                if valid {
+                    push_position(&mut output, &mut seen, Some(p), limit);
+                }
+            }
+        }
+        Shape::Tunnel => {
+            let forward = if normal[1] != 0 { [0, 0, 1] } else { normal };
+            for depth in 1..=limit as i32 {
+                for height in 0..=1 {
+                    push_position(
+                        &mut output,
+                        &mut seen,
+                        add_offset(origin, forward, depth, [0, 0, 0], 0, [0, height, 0]),
+                        limit,
+                    );
+                    if output.len() >= limit { break; }
+                }
+                if output.len() >= limit { break; }
+            }
+        }
+        Shape::StaircaseUp | Shape::StaircaseDown => {
+            let forward = if normal[1] != 0 { [0, 0, 1] } else { normal };
+            let lateral = [-forward[2], 0, forward[0]];
+            let rise = if shape == Shape::StaircaseUp { 1 } else { -1 };
+            for depth in 1..=limit as i32 {
+                for width in [0, -1, 1] {
+                    push_position(
+                        &mut output,
+                        &mut seen,
+                        add_offset(origin, forward, depth, lateral, width, [0, rise * depth, 0]),
+                        limit,
+                    );
+                    if output.len() >= limit { break; }
+                }
+                if output.len() >= limit { break; }
+            }
+        }
+    }
+    output
+}
+
 pub fn preview<H: Host>(
     host: &H,
     origin: Position,
     targets: &BTreeSet<String>,
     settings: &Settings,
 ) -> Vec<Hit> {
-    let mut hits = Vec::new();
+    preview_with_face(host, origin, targets, settings, [0, 1, 0])
+}
+
+pub fn preview_with_face<H: Host>(
+    host: &H,
+    origin: Position,
+    targets: &BTreeSet<String>,
+    settings: &Settings,
+    face: Position,
+) -> Vec<Hit> {
     if settings.validate().is_err() {
-        return hits;
+        return Vec::new();
     }
+    if settings.shape != Shape::Shapeless {
+        let positions = geometric_positions(origin, face, settings.shape, settings.max_chain);
+        return positions
+            .into_iter()
+            .filter_map(|position| {
+                let block = host.block(position)?;
+                if !block.breakable || settings.need_correct_tool && !host.can_harvest(&block) {
+                    return None;
+                }
+                Some(Hit { position, block })
+            })
+            .collect();
+    }
+
+    let Some(origin_block) = host.block(origin) else { return Vec::new(); };
+    if !origin_block.breakable || !targets.contains(&origin_block.name) {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
     let mut seen = BTreeSet::from([origin]);
     let mut queue = VecDeque::from([origin]);
     // This bound caps reads of nonmatching neighbours as well as accepted blocks.
@@ -293,11 +516,9 @@ pub fn preview<H: Host>(
         if hits.len() >= settings.max_chain {
             break;
         }
-        let Some(block) = host.block(position) else {
-            continue;
-        };
+        let Some(block) = host.block(position) else { continue; };
         if !block.breakable
-            || !targets.contains(&block.name)
+            || !same_shapeless_family(&origin_block, &block, targets, settings)
             || settings.need_correct_tool && !host.can_harvest(&block)
         {
             continue;
@@ -311,9 +532,7 @@ pub fn preview<H: Host>(
                         position[0].checked_add(x),
                         position[1].checked_add(y),
                         position[2].checked_add(z),
-                    ) else {
-                        continue;
-                    };
+                    ) else { continue; };
                     let next = [x, y, z];
                     if seen.len() < max_examined && seen.insert(next) {
                         queue.push_back(next);
@@ -347,13 +566,30 @@ impl Runtime {
         config: &Config,
         origin: Position,
     ) -> Result<Report, H::Error> {
+        self.mine_with_face(host, config, origin, [0, 1, 0])
+    }
+
+    pub fn mine_with_face<H: Host>(
+        &mut self,
+        host: &mut H,
+        config: &Config,
+        origin: Position,
+        face: Position,
+    ) -> Result<Report, H::Error> {
         let player = host.player();
         let tool = host.tool();
         let seed = host.block(origin);
-        let action = seed
-            .as_ref()
-            .filter(|b| b.breakable)
-            .and_then(|b| config.action(&b.name, tool.as_ref().map(|t| t.item.as_str())));
+        let action = seed.as_ref().filter(|b| b.breakable).and_then(|b| {
+            if config.settings.shape == Shape::Shapeless {
+                config.action(&b.name, tool.as_ref().map(|t| t.item.as_str()))
+            } else if config.settings.enabled {
+                // Geometric Liteminer shapes are selected by the clicked face,
+                // not by matching the origin against the shapeless whitelist.
+                Some((config.settings.clone(), BTreeSet::new()))
+            } else {
+                None
+            }
+        });
         let action = action.filter(|(settings, _)| {
             settings.enabled
                 && player.survival
@@ -366,7 +602,7 @@ impl Runtime {
                     .is_none_or(|end| player.tick >= *end)
         });
         let hits = if let Some((settings, targets)) = &action {
-            preview(host, origin, targets, settings)
+            preview_with_face(host, origin, targets, settings, face)
         } else {
             Vec::new()
         };
@@ -422,7 +658,7 @@ impl Runtime {
 }
 
 }
-use engine::{Block, Config, Host, Player, Position, Runtime, Tool};
+use engine::{Block, Config, Host, Player, Position, Runtime, Shape, Tool};
 
 #[derive(Default)]
 pub(super) struct State {
@@ -499,10 +735,25 @@ impl Host for Native<'_, '_> {
         }
         let state = self.game.world.block(p[0], p[1], p[2]);
         let facts = self.game.res.facts().get(state);
+        let name = facts.name.to_string();
+        let plant = facts.classes.iter().any(|class| {
+            matches!(class.as_ref(), "FlowerBlock" | "TallGrassBlock" | "DoublePlantBlock")
+        });
+        let growth = ["age", "stage"].into_iter().find_map(|property| {
+            let value = self.game.native_block_property(p, property)?;
+            let values = self.game.pack.assets.registry.property_values(&name, property);
+            let max = values.len().checked_sub(1)?;
+            let current = values.iter().position(|candidate| *candidate == value.as_str())?;
+            Some((current as u32, max as u32))
+        });
         Some(Block {
-            name: facts.name.to_string(),
+            name,
             state: state.0,
-            breakable: facts.hardness >= 0.0 && !self.game.world.is_air(state),
+            breakable: facts.hardness >= 0.0
+                && !self.game.world.is_air(state)
+                && facts.fluid == horizon_client::items::blocks::Fluid::None,
+            plant,
+            growth,
         })
     }
     fn tool(&self) -> Option<Tool> {
@@ -575,10 +826,11 @@ impl Game<'_> {
                     config
                 }));
             }
+            let face = game.pick().map(|hit| hit.face).unwrap_or([0, 1, 0]);
             let config = state.config.as_ref().unwrap();
             state
                 .runtime
-                .mine(&mut Native { game }, config, pos)
+                .mine_with_face(&mut Native { game }, config, pos, face)
                 .map(|_| ())
         })
     }
@@ -592,13 +844,36 @@ impl Game<'_> {
             let actor = game.acting_player_uuid();
             let message = match args.as_slice() {
                 [] | ["status"] => format!(
-                    "Veinminer: {}",
-                    if state.runtime.enabled(actor) {
-                        "on"
-                    } else {
-                        "off"
-                    }
+                    "Veinminer: {} | Shape: {}",
+                    if state.runtime.enabled(actor) { "on" } else { "off" },
+                    state.config.as_ref().map_or("Shapeless", |c| c.settings.shape.label())
                 ),
+                ["shape", name] => {
+                    let shape = match *name {
+                        "shapeless" => Shape::Shapeless,
+                        "tunnel" => Shape::Tunnel,
+                        "3x3" | "three_by_three" => Shape::ThreeByThree,
+                        "up" | "staircase_up" => Shape::StaircaseUp,
+                        "down" | "staircase_down" => Shape::StaircaseDown,
+                        _ => {
+                            game.command_failure(horizon_client::text::Text::literal(
+                                "Usage: /veinminer shape [shapeless|tunnel|3x3|up|down]",
+                            ));
+                            return Some(false);
+                        }
+                    };
+                    if state.config.is_none() {
+                        match load_config() {
+                            Ok(config) => state.config = Some(config),
+                            Err(error) => {
+                                game.command_failure(horizon_client::text::Text::literal(error));
+                                return Some(false);
+                            }
+                        }
+                    }
+                    state.config.as_mut().unwrap().settings.shape = shape;
+                    format!("VeinMiner shape: {}", shape.label())
+                },
                 ["toggle"] | ["on"] | ["off"] => {
                     let on = match args[0] {
                         "on" => true,
@@ -628,7 +903,7 @@ impl Game<'_> {
                 }
                 _ => {
                     game.command_failure(horizon_client::text::Text::literal(
-                        "Usage: /veinminer [status|toggle|on|off|reload]",
+                        "Usage: /veinminer [status|toggle|on|off|reload|shape <shapeless|tunnel|3x3|up|down>]",
                     ));
                     return Some(false);
                 }
@@ -694,6 +969,8 @@ fn block(name: &str, state: u32) -> Block {
         name: name.into(),
         state,
         breakable: true,
+        plant: false,
+        growth: None,
     }
 }
 impl Host for World {
@@ -956,6 +1233,72 @@ fn coordinates_at_integer_limits_do_not_wrap_to_other_chunks() {
         .len(),
         1
     );
+}
+
+#[test]
+fn three_by_three_shape_uses_clicked_face_plane_and_includes_mixed_blocks() {
+    let points: Vec<_> = (-1..=1)
+        .flat_map(|x| (-1..=1).map(move |z| [x, 0, z]))
+        .collect();
+    let mut w = World::new(&points);
+    w.blocks.insert([1, 0, 1], block("minecraft:stone", 9));
+    let mut c = Config::default();
+    c.settings.shape = Shape::ThreeByThree;
+    c.settings.max_chain = 9;
+    let hits = preview_with_face(&w, [0, 0, 0], &BTreeSet::new(), &c.settings, [0, 1, 0]);
+    assert_eq!(hits.len(), 9);
+    assert!(hits.iter().any(|hit| hit.block.name == "minecraft:stone"));
+}
+
+#[test]
+fn tunnel_and_staircase_walkers_are_bounded_and_directional() {
+    let mut w = World::new(&[[0, 0, 0], [1, 0, 0], [1, 1, 0], [2, 0, 0]]);
+    let mut c = Config::default();
+    c.settings.shape = Shape::Tunnel;
+    c.settings.max_chain = 4;
+    assert_eq!(preview_with_face(&w, [0, 0, 0], &BTreeSet::new(), &c.settings, [1, 0, 0]).len(), 4);
+
+    w = World::new(&[[0, 0, 0], [1, 1, 0], [2, 2, 0]]);
+    c.settings.shape = Shape::StaircaseUp;
+    c.settings.max_chain = 5;
+    assert_eq!(preview_with_face(&w, [0, 0, 0], &BTreeSet::new(), &c.settings, [1, 0, 0]).len(), 3);
+    c.settings.shape = Shape::StaircaseDown;
+    w = World::new(&[[0, 0, 0], [1, -1, 0], [2, -2, 0]]);
+    assert_eq!(preview_with_face(&w, [0, 0, 0], &BTreeSet::new(), &c.settings, [1, 0, 0]).len(), 3);
+}
+
+#[test]
+fn shapeless_matches_ore_variants_and_plant_families_but_keeps_crop_maturity() {
+    let mut w = World::new(&[[0, 0, 0], [1, 0, 0]]);
+    w.blocks.insert([1, 0, 0], block("minecraft:raw_iron_block", 2));
+    let targets = BTreeSet::from(["minecraft:iron_ore".into()]);
+    assert_eq!(preview(&w, [0, 0, 0], &targets, &Settings::default()).len(), 2);
+
+    w = World::new(&[[0, 0, 0], [1, 0, 0]]);
+    w.blocks.insert([0, 0, 0], block("minecraft:diamond_ore", 3));
+    w.blocks.insert([1, 0, 0], block("minecraft:deepslate_diamond_ore", 4));
+    assert_eq!(preview(&w, [0, 0, 0], &["minecraft:diamond_ore".into()].into(), &Settings::default()).len(), 2);
+
+    w = World::new(&[[0, 0, 0], [1, 0, 0]]);
+    let mut flower = block("minecraft:dandelion", 5);
+    flower.plant = true;
+    let mut grass = block("minecraft:short_grass", 6);
+    grass.plant = true;
+    w.blocks.insert([0, 0, 0], flower);
+    w.blocks.insert([1, 0, 0], grass);
+    assert_eq!(preview(&w, [0, 0, 0], &["minecraft:dandelion".into()].into(), &Settings::default()).len(), 2);
+
+    w = World::new(&[[0, 0, 0], [1, 0, 0]]);
+    let mut young = block("minecraft:wheat", 1);
+    young.growth = Some((1, 7));
+    w.blocks.insert([0, 0, 0], young);
+    let mut mature = block("minecraft:wheat", 2);
+    mature.growth = Some((7, 7));
+    w.blocks.insert([1, 0, 0], mature);
+    let mut settings = Settings::default();
+    assert_eq!(preview(&w, [0, 0, 0], &["minecraft:wheat".into()].into(), &settings).len(), 1);
+    settings.match_crop_maturity = false;
+    assert_eq!(preview(&w, [0, 0, 0], &["minecraft:wheat".into()].into(), &settings).len(), 2);
 }
 
 }
