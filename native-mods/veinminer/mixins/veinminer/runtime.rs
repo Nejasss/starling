@@ -1327,6 +1327,8 @@ impl Game<'_> {
                     config
                 }));
             }
+            let actor = game.acting_player_uuid();
+            let active = state.active.get(&actor).copied().unwrap_or(false);
             let shape = state.config.as_ref().unwrap().settings.shape;
             let mode = if game
                 .native_setting(ID, "key_mode")
@@ -1335,6 +1337,7 @@ impl Game<'_> {
             let flag = |name: &str| {
                 game.native_setting(ID, name).is_none_or(|value| value.trim() != "false")
             };
+            buttons.push(format!("VeinMiner: {}", if active { "ON" } else { "OFF" }));
             buttons.push(format!("Activation: {mode}"));
             buttons.push(format!("Shape: {}", shape.label()));
             buttons.push(format!("Show HUD: {}", if flag("show_hud") { "ON" } else { "OFF" }));
@@ -1345,13 +1348,25 @@ impl Game<'_> {
     pub(super) fn veinminer_settings_click(&mut self, button: usize) {
         const ID: &str = "veinminer";
         match button {
+            // Explicit activation control for Android/touch users without a
+            // physical keyboard. It shares the same per-player state as the
+            // keybind and /veinminer on|off commands.
             0 => {
+                with_state(self, |game, state| {
+                    let actor = game.acting_player_uuid();
+                    let active = !state.active.get(&actor).copied().unwrap_or(false);
+                    state.active.insert(actor, active);
+                    state.selection = None;
+                    game.native_chat(if active { "VeinMiner: ON" } else { "VeinMiner: OFF" });
+                });
+            }
+            1 => {
                 let toggle = self
                     .native_setting(ID, "key_mode")
                     .is_none_or(|value| value.trim() != "toggle");
                 self.native_set_setting(ID, "key_mode", if toggle { "toggle" } else { "hold" });
             }
-            1 => {
+            2 => {
                 with_state(self, |game, state| {
                     if state.config.is_none() {
                         state.config = Some(load_config_for(game).unwrap_or_else(|error| {
@@ -1366,13 +1381,16 @@ impl Game<'_> {
                         config.settings.shape = config.settings.shape.cycle(true);
                         config.settings.shape
                     };
+                    // Drop any frame-local preview so the new shape is used
+                    // immediately by HUD, highlight and mining hooks.
+                    state.selection = None;
                     game.native_set_setting(ID, "shape", shape.key());
                     let message = format!("VeinMiner shape: {}", shape.label());
                     game.native_chat(&message);
                 });
             }
-            2 | 3 => {
-                let name = if button == 2 { "show_hud" } else { "show_highlights" };
+            3 | 4 => {
+                let name = if button == 3 { "show_hud" } else { "show_highlights" };
                 let shown = self
                     .native_setting(ID, name)
                     .is_none_or(|value| value.trim() != "false");
@@ -1381,7 +1399,6 @@ impl Game<'_> {
             _ => {}
         }
     }
-
     pub(super) fn veinminer_visuals(
         &self,
         rims: &mut Vec<horizon_client::mod_api::NativeBlockRim>,
