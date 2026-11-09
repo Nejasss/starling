@@ -1019,12 +1019,13 @@ impl Host for Native<'_, '_> {
 }
 struct PreviewNative<'g, 'r> {
     game: &'g Game<'r>,
+    actor: [i32; 4],
 }
 impl Host for PreviewNative<'_, '_> {
     type Error = std::convert::Infallible;
     fn player(&mut self) -> Player {
         Player {
-            actor: self.game.acting_player_uuid(),
+            actor: self.actor,
             name: self.game.lan_acting_name.as_deref().unwrap_or(super::chat::PLAYER_NAME).to_owned(),
             tick: self.game.world.game_time,
             survival: self.game.remote.is_none()
@@ -1127,7 +1128,14 @@ impl Game<'_> {
         let Some(hit) = self.pick() else { return 1.0; };
         let origin = hit.pos;
         let face = hit.face;
-        let mut host = PreviewNative { game: self };
+        let actor = match self.lan_acting_uuid {
+            Some(guest) => horizon_client::lan::playerdata::uuid_ints(guest),
+            None => match self.level.player_uuid {
+                Some(uuid) => uuid,
+                None => return 1.0,
+            },
+        };
+        let mut host = PreviewNative { game: self, actor };
         let player = host.player();
         let tool = host.tool();
         let seed = host.block(origin);
