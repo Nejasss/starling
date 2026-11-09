@@ -751,7 +751,7 @@ impl Host for Native<'_, '_> {
             state: state.0,
             breakable: facts.hardness >= 0.0
                 && !self.game.world.is_air(state)
-                && facts.fluid == horizon_client::items::blocks::Fluid::None,
+                && facts.fluid == horizon_client::blocks::Fluid::None,
             plant,
             growth,
         })
