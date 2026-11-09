@@ -922,16 +922,19 @@ fn activation_setting_key(actor: Actor) -> String {
 }
 
 fn is_active(game: &Game<'_>, actor: Actor) -> bool {
-    game.native_setting("veinminer", &activation_setting_key(actor))
+    game.native_setting("veinminer", "active")
+        .or_else(|| game.native_setting("veinminer", &activation_setting_key(actor)))
         .is_some_and(|value| matches!(value.trim(), "true" | "1" | "on"))
 }
 
 fn set_active(game: &Game<'_>, actor: Actor, active: bool) {
-    game.native_set_setting(
-        "veinminer",
-        &activation_setting_key(actor),
-        if active { "true" } else { "false" },
-    );
+    let value = if active { "true" } else { "false" };
+
+    // Shared activation keeps the menu, commands and mining hooks in sync.
+    game.native_set_setting("veinminer", "active", value);
+
+    // Preserve the legacy per-player value for compatibility.
+    game.native_set_setting("veinminer", &activation_setting_key(actor), value);
 }
 
 fn sync_shape_from_setting(game: &Game<'_>, config: &mut Config) {

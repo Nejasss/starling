@@ -71,7 +71,7 @@ impl Game<'_> {
                     <= 16384.0
         };
         const MAX_RIMS: usize = 64;
-        const MAX_EDGES: usize = MAX_RIMS * 24;
+        const MAX_EDGES: usize = MAX_RIMS * 16;
         let mut edges = 0;
         for rim in rims.into_iter().take(MAX_RIMS) {
             let pos = rim.pos;
