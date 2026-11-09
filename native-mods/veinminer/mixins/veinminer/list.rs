@@ -5,6 +5,6 @@ fn veinminer_list(mods: &mut Vec<crate::game::native_hooks::NativeMod>) {
         id: "veinminer".into(),
         title: "VeinMiner 0.6.0".into(),
         description: "Shapeless veins, tunnel, 3x3 plane and stair mining shapes.".into(),
-        keys: vec![],
+        keys: vec![["veinmine".into(), "Vein mine".into(), "key.keyboard.grave.accent".into()]],
     });
 }

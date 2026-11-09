@@ -22,11 +22,49 @@ impl Shape {
     pub fn label(self) -> &'static str {
         match self {
             Self::Shapeless => "Shapeless",
-            Self::Tunnel => "Tunnel",
+            Self::Tunnel => "Small Tunnel",
             Self::ThreeByThree => "3x3",
             Self::StaircaseUp => "Staircase Up",
             Self::StaircaseDown => "Staircase Down",
         }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Shapeless => "shapeless",
+            Self::Tunnel => "small_tunnel",
+            Self::StaircaseUp => "staircase_up",
+            Self::StaircaseDown => "staircase_down",
+            Self::ThreeByThree => "three_by_three",
+        }
+    }
+
+    pub fn from_key(value: &str) -> Option<Self> {
+        match value {
+            "shapeless" => Some(Self::Shapeless),
+            "tunnel" | "small_tunnel" => Some(Self::Tunnel),
+            "3x3" | "three_by_three" => Some(Self::ThreeByThree),
+            "up" | "staircase_up" => Some(Self::StaircaseUp),
+            "down" | "staircase_down" => Some(Self::StaircaseDown),
+            _ => None,
+        }
+    }
+
+    pub fn cycle(self, forward: bool) -> Self {
+        const ORDER: [Shape; 5] = [
+            Shape::Shapeless,
+            Shape::Tunnel,
+            Shape::StaircaseUp,
+            Shape::StaircaseDown,
+            Shape::ThreeByThree,
+        ];
+        let at = ORDER.iter().position(|shape| *shape == self).unwrap_or(0);
+        let next = if forward {
+            (at + 1) % ORDER.len()
+        } else {
+            (at + ORDER.len() - 1) % ORDER.len()
+        };
+        ORDER[next]
     }
 }
 
@@ -77,8 +115,8 @@ impl Default for Settings {
             enabled: true,
             cooldown: 20,
             must_sneak: false,
-            max_chain: 100,
-            need_correct_tool: true,
+            max_chain: 64,
+            need_correct_tool: false,
             search_radius: 1,
             decrease_durability: true,
             prevent_tool_breaking: true,
@@ -99,8 +137,8 @@ impl Default for Settings {
 }
 impl Settings {
     pub fn validate(&self) -> Result<(), String> {
-        if !(1..=4096).contains(&self.max_chain) {
-            return Err("maxChain must be 1..4096 (including the original block)".into());
+        if !(1..=2048).contains(&self.max_chain) {
+            return Err("maxChain must be 1..2048 (including the original block)".into());
         }
         if !(1..=3).contains(&self.search_radius) {
             return Err("searchRadius must be 1..3".into());
@@ -337,6 +375,7 @@ pub struct Player {
     pub tick: i64,
     pub survival: bool,
     pub sneaking: bool,
+    pub active: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tool {
@@ -726,6 +765,7 @@ impl Runtime {
         });
         let action = action.filter(|(settings, _)| {
             settings.enabled
+                && player.active
                 && player.survival
                 && self.enabled(player.actor)
                 && (!settings.must_sneak || player.sneaking)
@@ -806,12 +846,28 @@ impl Runtime {
 }
 
 }
-use engine::{Block, Config, DropMode, Host, Player, Position, Runtime, Shape, Tool};
+use engine::{Actor, Block, Config, DropMode, Host, Player, Position, Runtime, Shape, Tool};
+
+#[derive(Clone, Debug)]
+struct CachedSelection {
+    actor: Actor,
+    origin: Position,
+    face: Position,
+    tick: i64,
+    shape: Shape,
+    tool: Option<Tool>,
+    sneaking: bool,
+    positions: Vec<Position>,
+}
 
 #[derive(Default)]
 pub(super) struct State {
     runtime: Runtime,
     config: Option<Config>,
+    /// Local activation state, by the player whose keybind or command changed it.
+    active: std::collections::BTreeMap<Actor, bool>,
+    /// Reused by the HUD, block outline and world-rim hooks within a game tick.
+    selection: Option<CachedSelection>,
 }
 
 thread_local! {
@@ -849,10 +905,23 @@ fn load_config() -> std::result::Result<Config, String> {
     }
 }
 
+fn load_config_for(game: &Game<'_>) -> std::result::Result<Config, String> {
+    let mut config = load_config()?;
+    if let Some(shape) = game
+        .native_setting("veinminer", "shape")
+        .as_deref()
+        .and_then(Shape::from_key)
+    {
+        config.settings.shape = shape;
+    }
+    Ok(config)
+}
+
 struct Native<'g, 'r> {
     game: &'g mut Game<'r>,
     origin: Position,
     drop_mode: DropMode,
+    active: bool,
 }
 impl Host for Native<'_, '_> {
     type Error = Box<dyn std::error::Error>;
@@ -874,6 +943,7 @@ impl Host for Native<'_, '_> {
                 .game
                 .keys
                 .contains(&winit::keyboard::KeyCode::ShiftLeft),
+            active: self.active,
         }
     }
     fn block(&self, p: Position) -> Option<Block> {
@@ -1020,6 +1090,7 @@ impl Host for Native<'_, '_> {
 struct PreviewNative<'g, 'r> {
     game: &'g Game<'r>,
     actor: [i32; 4],
+    active: bool,
 }
 impl Host for PreviewNative<'_, '_> {
     type Error = std::convert::Infallible;
@@ -1033,6 +1104,7 @@ impl Host for PreviewNative<'_, '_> {
                 && self.game.may_build()
                 && !self.game.creative,
             sneaking: self.game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft),
+            active: self.active,
         }
     }
     fn block(&self, p: Position) -> Option<Block> {
@@ -1092,11 +1164,303 @@ impl Host for PreviewNative<'_, '_> {
     }
     fn exhaust(&mut self, _amount: f32) {}
 }
+fn refresh_selection(game: &Game<'_>, state: &mut State) -> Option<CachedSelection> {
+    if !game.native_on("veinminer") || !game.native_playing() {
+        state.selection = None;
+        return None;
+    }
+    let actor = match game.lan_acting_uuid {
+        Some(guest) => horizon_client::lan::playerdata::uuid_ints(guest),
+        None => game.level.player_uuid?,
+    };
+    if !state.active.get(&actor).copied().unwrap_or(false) {
+        state.selection = None;
+        return None;
+    }
+    let Some(hit) = game.pick() else {
+        state.selection = None;
+        return None;
+    };
+    if state.config.is_none() {
+        state.config = Some(load_config_for(game).unwrap_or_else(|error| {
+            eprintln!("Veinminer disabled: {error}");
+            let mut config = Config::default();
+            config.settings.enabled = false;
+            config
+        }));
+    }
+
+    let mut host = PreviewNative { game, actor, active: true };
+    let player = host.player();
+    let tool = host.tool();
+    let Some(seed) = host.block(hit.pos).filter(|block| block.breakable) else {
+        state.selection = None;
+        return None;
+    };
+
+    let (settings, targets) = {
+        let config = state.config.as_ref()?;
+        let action = if config.settings.shape == Shape::Shapeless {
+            config.action(&seed.name, tool.as_ref().map(|t| t.item.as_str()))
+        } else if config.settings.enabled {
+            Some((config.settings.clone(), std::collections::BTreeSet::new()))
+        } else {
+            None
+        };
+        let Some((settings, targets)) = action.filter(|(settings, _)| {
+            settings.enabled
+                && player.survival
+                && state.runtime.enabled(actor)
+                && (!settings.must_sneak || player.sneaking)
+                && (!settings.permission_restricted || config.players.contains(&player.name))
+                && (!settings.requires_food_for_vein_mining() || host.has_food())
+                && state.runtime.cooldown_ready(actor, player.tick, settings.shape)
+        }) else {
+            state.selection = None;
+            return None;
+        };
+        (settings, targets)
+    };
+
+    // Crosshair, face, held tool, player posture and shape form the cache key.
+    // A changed aim or a new tick triggers one fresh traversal; HUD and renderer
+    // hooks in the same tick reuse the exact same selection.
+    if let Some(cached) = state.selection.as_ref().filter(|cached| {
+        cached.actor == actor
+            && cached.origin == hit.pos
+            && cached.face == hit.face
+            && cached.tick == player.tick
+            && cached.shape == settings.shape
+            && cached.tool == tool
+            && cached.sneaking == player.sneaking
+    }) {
+        return Some(cached.clone());
+    }
+
+    let positions = engine::preview_with_face(&host, hit.pos, &targets, &settings, hit.face)
+        .into_iter()
+        .map(|selected| selected.position)
+        .collect();
+    let selection = CachedSelection {
+        actor,
+        origin: hit.pos,
+        face: hit.face,
+        tick: player.tick,
+        shape: settings.shape,
+        tool,
+        sneaking: player.sneaking,
+        positions,
+    };
+    state.selection = Some(selection.clone());
+    Some(selection)
+}
+
 impl Game<'_> {
+    pub(super) fn veinminer_key(&mut self, key: &str, pressed: bool) {
+        const ID: &str = "veinminer";
+        const KEY: &str = "veinmine";
+        const DEFAULT_KEY: &str = "key.keyboard.grave.accent";
+        if !self.native_on(ID) {
+            return;
+        }
+        let bound = self.native_mod_key(ID, KEY, DEFAULT_KEY);
+        if key != bound || (pressed && !self.native_playing()) {
+            return;
+        }
+        let toggle = self
+            .native_setting(ID, "key_mode")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("toggle"));
+        let actor = self.acting_player_uuid();
+        with_state(self, |game, state| {
+            let was_active = state.active.get(&actor).copied().unwrap_or(false);
+            let active = if toggle {
+                if pressed { !was_active } else { was_active }
+            } else {
+                pressed
+            };
+            if active == was_active {
+                return;
+            }
+            state.active.insert(actor, active);
+            game.native_chat(if active { "VeinMiner: ON" } else { "VeinMiner: OFF" });
+        });
+    }
+
+    pub(super) fn veinminer_wheel(&mut self, steps: f32, claimed: &mut bool) {
+        const ID: &str = "veinminer";
+        if steps == 0.0 || !self.native_on(ID) || !self.native_playing() {
+            return;
+        }
+        let actor = self.acting_player_uuid();
+        with_state(self, |game, state| {
+            if !state.active.get(&actor).copied().unwrap_or(false) {
+                return;
+            }
+            if state.config.is_none() {
+                state.config = Some(load_config_for(game).unwrap_or_else(|error| {
+                    eprintln!("Veinminer disabled: {error}");
+                    let mut config = Config::default();
+                    config.settings.enabled = false;
+                    config
+                }));
+            }
+            let shape = {
+                let config = state.config.as_mut().unwrap();
+                config.settings.shape = config.settings.shape.cycle(steps < 0.0);
+                config.settings.shape
+            };
+            game.native_set_setting(ID, "shape", shape.key());
+            let message = format!("VeinMiner shape: {}", shape.label());
+            game.native_chat(&message);
+            *claimed = true;
+        });
+    }
+
+    pub(super) fn veinminer_settings(&mut self, buttons: &mut Vec<String>) {
+        const ID: &str = "veinminer";
+        with_state(self, |game, state| {
+            if state.config.is_none() {
+                state.config = Some(load_config_for(game).unwrap_or_else(|error| {
+                    eprintln!("Veinminer disabled: {error}");
+                    let mut config = Config::default();
+                    config.settings.enabled = false;
+                    config
+                }));
+            }
+            let shape = state.config.as_ref().unwrap().settings.shape;
+            let mode = if game
+                .native_setting(ID, "key_mode")
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("toggle"))
+            { "Toggle" } else { "Hold" };
+            let flag = |name: &str| {
+                game.native_setting(ID, name).is_none_or(|value| value.trim() != "false")
+            };
+            buttons.push(format!("Activation: {mode}"));
+            buttons.push(format!("Shape: {}", shape.label()));
+            buttons.push(format!("Show HUD: {}", if flag("show_hud") { "ON" } else { "OFF" }));
+            buttons.push(format!("Show highlights: {}", if flag("show_highlights") { "ON" } else { "OFF" }));
+        });
+    }
+
+    pub(super) fn veinminer_settings_click(&mut self, button: usize) {
+        const ID: &str = "veinminer";
+        match button {
+            0 => {
+                let toggle = self
+                    .native_setting(ID, "key_mode")
+                    .is_none_or(|value| value.trim() != "toggle");
+                self.native_set_setting(ID, "key_mode", if toggle { "toggle" } else { "hold" });
+            }
+            1 => {
+                with_state(self, |game, state| {
+                    if state.config.is_none() {
+                        state.config = Some(load_config_for(game).unwrap_or_else(|error| {
+                            eprintln!("Veinminer disabled: {error}");
+                            let mut config = Config::default();
+                            config.settings.enabled = false;
+                            config
+                        }));
+                    }
+                    let shape = {
+                        let config = state.config.as_mut().unwrap();
+                        config.settings.shape = config.settings.shape.cycle(true);
+                        config.settings.shape
+                    };
+                    game.native_set_setting(ID, "shape", shape.key());
+                    let message = format!("VeinMiner shape: {}", shape.label());
+                    game.native_chat(&message);
+                });
+            }
+            2 | 3 => {
+                let name = if button == 2 { "show_hud" } else { "show_highlights" };
+                let shown = self
+                    .native_setting(ID, name)
+                    .is_none_or(|value| value.trim() != "false");
+                self.native_set_setting(ID, name, if shown { "false" } else { "true" });
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn veinminer_visuals(
+        &self,
+        rims: &mut Vec<horizon_client::mod_api::NativeBlockRim>,
+    ) {
+        if self
+            .native_setting("veinminer", "show_highlights")
+            .is_some_and(|value| value.trim() == "false")
+        {
+            return;
+        }
+        let selection = STATES.with(|states| {
+            let mut states = states.borrow_mut();
+            let state = states.entry(self.world_root.clone()).or_default();
+            refresh_selection(self, state)
+        });
+        if let Some(selection) = selection {
+            // Horizon's frame renderer accepts at most eight depth-tested block rims.
+            for pos in selection.positions.into_iter().take(8) {
+                rims.push(horizon_client::mod_api::NativeBlockRim {
+                    pos,
+                    argb: 0xFFF9FFFE,
+                    width: 2.0,
+                });
+            }
+        }
+    }
+
+    pub(super) fn veinminer_block_highlight(&self, pos: Position, canceled: &mut bool) {
+        if *canceled
+            || self
+                .native_setting("veinminer", "show_highlights")
+                .is_some_and(|value| value.trim() == "false")
+        {
+            return;
+        }
+        let selected = STATES.with(|states| {
+            let mut states = states.borrow_mut();
+            let state = states.entry(self.world_root.clone()).or_default();
+            refresh_selection(self, state)
+                .is_some_and(|selection| selection.positions.contains(&pos))
+        });
+        if selected {
+            *canceled = true;
+        }
+    }
+
+    pub(super) fn veinminer_hud(
+        &mut self,
+        batch: &mut horizon_client::hud::HudBatch,
+        corners: &mut horizon_client::extras_hud::Corners,
+    ) {
+        use horizon_client::extras::Corner;
+        if self
+            .native_setting("veinminer", "show_hud")
+            .is_some_and(|value| value.trim() == "false")
+            || !self.native_corner_shown(Corner::TopRight)
+        {
+            return;
+        }
+        let selection = with_state(self, |game, state| refresh_selection(game, state));
+        let Some(selection) = selection.filter(|selection| !selection.positions.is_empty()) else {
+            return;
+        };
+        let label = format!(
+            "VeinMiner: {} | {}",
+            selection.positions.len(),
+            selection.shape.label()
+        );
+        let width = self.native_text_width(&label) + 8.0;
+        let height = 14.0;
+        let (x, y) = corners.place(Corner::TopRight, width, height);
+        self.native_fill(batch, [x, y, width, height], 0xA010_1018);
+        self.native_text(batch, &label, [x + 4.0, y + 3.0], 0xF9FFFE, true);
+    }
+
     pub(super) fn veinminer_break_block(&mut self, pos: Position) -> Result<()> {
         with_state(self, |game, state| {
             if state.config.is_none() {
-                state.config = Some(load_config().unwrap_or_else(|error| {
+                state.config = Some(load_config_for(game).unwrap_or_else(|error| {
                     eprintln!("Veinminer disabled: {error}");
                     let mut config = Config::default();
                     config.settings.enabled = false;
@@ -1113,10 +1477,12 @@ impl Game<'_> {
             let face = hit.map(|hit| hit.face);
             let config = state.config.as_ref().unwrap();
             let drop_mode = config.settings.drop_mode;
+            let actor = game.acting_player_uuid();
+            let active = state.active.get(&actor).copied().unwrap_or(false);
             state
                 .runtime
                 .mine_with_face(
-                    &mut Native { game, origin: pos, drop_mode },
+                    &mut Native { game, origin: pos, drop_mode, active },
                     config,
                     pos,
                     face,
@@ -1135,7 +1501,7 @@ impl Game<'_> {
                 None => return 1.0,
             },
         };
-        let mut host = PreviewNative { game: self, actor };
+        let mut host = PreviewNative { game: self, actor, active: true };
         let player = host.player();
         let tool = host.tool();
         let seed = host.block(origin);
@@ -1143,7 +1509,7 @@ impl Game<'_> {
             let mut states = states.borrow_mut();
             let state = states.entry(self.world_root.clone()).or_default();
             if state.config.is_none() {
-                state.config = Some(load_config().unwrap_or_else(|error| {
+                state.config = Some(load_config_for(self).unwrap_or_else(|error| {
                     eprintln!("Veinminer disabled: {error}");
                     let mut config = Config::default();
                     config.settings.enabled = false;
@@ -1162,6 +1528,7 @@ impl Game<'_> {
             });
             let action = action.filter(|(settings, _)| {
                 settings.enabled
+                    && state.active.get(&player.actor).copied().unwrap_or(false)
                     && settings.harvest_time_per_block_modifier_enabled
                     && player.survival
                     && state.runtime.enabled(player.actor)
@@ -1171,7 +1538,12 @@ impl Game<'_> {
                     && state.runtime.cooldown_ready(player.actor, player.tick, settings.shape)
             });
             let Some((settings, targets)) = action else { return 1.0; };
-            let count = engine::selected_block_count(&host, origin, &targets, &settings, face);
+            let count = refresh_selection(self, state)
+                .filter(|selection| selection.actor == player.actor && selection.origin == origin)
+                .map_or_else(
+                    || engine::selected_block_count(&host, origin, &targets, &settings, face),
+                    |selection| selection.positions.len(),
+                );
             engine::scaled_harvest_speed_modifier(count, settings.harvest_time_per_block_modifier)
         })
     }
@@ -1187,7 +1559,7 @@ impl Game<'_> {
             let message = match args.as_slice() {
                 [] | ["status"] => format!(
                     "Veinminer: {} | Shape: {} | Drops: {} | Tool safety: {} | Food: {} | Zero hunger: {} | Harvest speed: {}",
-                    if state.runtime.enabled(actor) { "on" } else { "off" },
+                    if state.active.get(&actor).copied().unwrap_or(false) && state.runtime.enabled(actor) { "on" } else { "off" },
                     state.config.as_ref().map_or("Shapeless", |c| c.settings.shape.label()),
                     state.config.as_ref().map_or("Together", |c| c.settings.drop_mode.label()),
                     if state.config.as_ref().is_none_or(|c| c.settings.prevent_tool_breaking) { "on" } else { "off" },
@@ -1210,7 +1582,7 @@ impl Game<'_> {
                         }
                     };
                     if state.config.is_none() {
-                        match load_config() {
+                        match load_config_for(game) {
                             Ok(config) => state.config = Some(config),
                             Err(error) => {
                                 game.command_failure(horizon_client::text::Text::literal(error));
@@ -1219,6 +1591,7 @@ impl Game<'_> {
                         }
                     }
                     state.config.as_mut().unwrap().settings.shape = shape;
+                    game.native_set_setting("veinminer", "shape", shape.key());
                     format!("VeinMiner shape: {}", shape.label())
                 },
                 ["drops", name] => {
@@ -1233,7 +1606,7 @@ impl Game<'_> {
                         }
                     };
                     if state.config.is_none() {
-                        match load_config() {
+                        match load_config_for(game) {
                             Ok(config) => state.config = Some(config),
                             Err(error) => {
                                 game.command_failure(horizon_client::text::Text::literal(error));
@@ -1256,7 +1629,7 @@ impl Game<'_> {
                         }
                     };
                     if state.config.is_none() {
-                        match load_config() {
+                        match load_config_for(game) {
                             Ok(config) => state.config = Some(config),
                             Err(error) => {
                                 game.command_failure(horizon_client::text::Text::literal(error));
@@ -1279,7 +1652,7 @@ impl Game<'_> {
                         }
                     };
                     if state.config.is_none() {
-                        match load_config() {
+                        match load_config_for(game) {
                             Ok(config) => state.config = Some(config),
                             Err(error) => {
                                 game.command_failure(horizon_client::text::Text::literal(error));
@@ -1302,7 +1675,7 @@ impl Game<'_> {
                         }
                     };
                     if state.config.is_none() {
-                        match load_config() {
+                        match load_config_for(game) {
                             Ok(config) => state.config = Some(config),
                             Err(error) => {
                                 game.command_failure(horizon_client::text::Text::literal(error));
@@ -1325,7 +1698,7 @@ impl Game<'_> {
                         }
                     };
                     if state.config.is_none() {
-                        match load_config() {
+                        match load_config_for(game) {
                             Ok(config) => state.config = Some(config),
                             Err(error) => {
                                 game.command_failure(horizon_client::text::Text::literal(error));
@@ -1337,12 +1710,13 @@ impl Game<'_> {
                     format!("VeinMiner harvest speed modifier: {}", if enabled { "on" } else { "off" })
                 }
                 ["toggle"] | ["on"] | ["off"] => {
+                    let current = state.active.get(&actor).copied().unwrap_or(false);
                     let on = match args[0] {
                         "on" => true,
                         "off" => false,
-                        _ => !state.runtime.enabled(actor),
+                        _ => !current,
                     };
-                    state.runtime.set_enabled(actor, on);
+                    state.active.insert(actor, on);
                     format!("Veinminer: {}", if on { "on" } else { "off" })
                 }
                 ["reload"] => {
@@ -1352,7 +1726,7 @@ impl Game<'_> {
                         ));
                         return Some(false);
                     }
-                    match load_config() {
+                    match load_config_for(game) {
                         Ok(config) => {
                             state.config = Some(config);
                             "Veinminer configuration reloaded".into()
@@ -1411,6 +1785,7 @@ impl World {
                 tick: 0,
                 survival: true,
                 sneaking: false,
+                active: true,
             },
             tool: Some(Tool {
                 item: "minecraft:iron_pickaxe".into(),
@@ -1631,6 +2006,32 @@ fn creative_adventure_sneak_tool_food_permissions_and_global_disable_gate_only_e
     c.players.insert("Alex".into());
     assert_eq!(mine(&mut w, &c).extra_broken, 1);
 }
+#[test]
+fn inactive_input_still_mines_the_origin_but_not_the_extra_blocks() {
+    let mut world = World::new(&[[0, 0, 0], [1, 0, 0]]);
+    world.player.active = false;
+    let report = mine(&mut world, &Config::default());
+    assert_eq!(report.extra_broken, 0);
+    assert_eq!(world.calls.len(), 1);
+}
+
+#[test]
+fn liteminer_shape_cycle_uses_registered_order() {
+    let mut shape = Shape::Shapeless;
+    for expected in [
+        Shape::Tunnel,
+        Shape::StaircaseUp,
+        Shape::StaircaseDown,
+        Shape::ThreeByThree,
+        Shape::Shapeless,
+    ] {
+        shape = shape.cycle(true);
+        assert_eq!(shape, expected);
+    }
+    assert_eq!(Shape::from_key("small_tunnel"), Some(Shape::Tunnel));
+    assert_eq!(Shape::from_key("three_by_three"), Some(Shape::ThreeByThree));
+}
+
 #[test]
 fn cooldown_and_toggles_are_per_player_and_original_mining_is_never_cancelled() {
     let mut rt = Runtime::default();
