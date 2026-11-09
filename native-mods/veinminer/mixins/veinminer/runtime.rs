@@ -643,10 +643,14 @@ impl Runtime {
                 && self.enabled(player.actor)
                 && (!settings.must_sneak || player.sneaking)
                 && (!settings.permission_restricted || config.players.contains(&player.name))
-                && self
-                    .cooldowns
-                    .get(&player.actor)
-                    .is_none_or(|end| player.tick >= *end)
+                // Keep the legacy cooldown for shapeless veins only. Liteminer geometric
+                // shapes are evaluated once for each player block-break action; applying
+                // this delay makes the next 3x3/tunnel/staircase click break only its origin.
+                && (settings.shape != Shape::Shapeless
+                    || self
+                        .cooldowns
+                        .get(&player.actor)
+                        .is_none_or(|end| player.tick >= *end))
         });
         let hits = if let Some((settings, targets)) = &action {
             preview_with_orientation(host, origin, targets, settings, face)
@@ -664,9 +668,11 @@ impl Runtime {
         let Some((settings, _)) = action else {
             return Ok(report);
         };
-        self.cooldowns.retain(|_, end| *end > player.tick);
-        self.cooldowns
-            .insert(player.actor, player.tick.saturating_add(settings.cooldown));
+        if settings.shape == Shape::Shapeless {
+            self.cooldowns.retain(|_, end| *end > player.tick);
+            self.cooldowns
+                .insert(player.actor, player.tick.saturating_add(settings.cooldown));
+        }
         for hit in hits.into_iter().skip(1) {
             if host.tool() != tool
                 && host.tool().as_ref().map(|t| &t.item) != tool.as_ref().map(|t| &t.item)
@@ -1246,6 +1252,38 @@ fn cooldown_and_toggles_are_per_player_and_original_mining_is_never_cancelled() 
     w.blocks.insert([0, 0, 0], block("minecraft:iron_ore", 1));
     assert_eq!(rt.mine(&mut w, &c, [0, 0, 0]).unwrap().extra_broken, 1);
 }
+#[test]
+fn geometric_three_by_three_can_run_on_consecutive_breaks_without_cooldown() {
+    let mut runtime = Runtime::default();
+    let mut config = Config::default();
+    config.settings.shape = Shape::ThreeByThree;
+    config.settings.max_chain = 9;
+
+    // Two separate 3x3 wall panels. Break both at the same player tick to
+    // reproduce quick consecutive clicks while the legacy cooldown is active.
+    let first_panel: Vec<_> = (-1..=1)
+        .flat_map(|y| (-1..=1).map(move |z| [0, y, z]))
+        .collect();
+    let mut world = World::new(&first_panel);
+    assert_eq!(world.player.tick, 0);
+
+    let first = runtime
+        .mine_with_face(&mut world, &config, [0, 0, 0], [1, 0, 0])
+        .unwrap();
+    assert_eq!((first.planned, first.extra_broken), (9, 8));
+
+    for y in -1..=1 {
+        for z in -1..=1 {
+            world.blocks.insert([10, y, z], block("minecraft:iron_ore", 1));
+        }
+    }
+    let second = runtime
+        .mine_with_face(&mut world, &config, [10, 0, 0], [1, 0, 0])
+        .unwrap();
+    assert_eq!((second.planned, second.extra_broken), (9, 8));
+    assert_eq!(world.calls.len(), 18);
+}
+
 #[test]
 fn group_tools_overrides_and_separate_group_mining_have_defined_precedence() {
     let mut c = Config::default();
