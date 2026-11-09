@@ -864,8 +864,6 @@ struct CachedSelection {
 pub(super) struct State {
     runtime: Runtime,
     config: Option<Config>,
-    /// Local activation state, by the player whose keybind or command changed it.
-    active: std::collections::BTreeMap<Actor, bool>,
     /// Reused by the HUD, block outline and world-rim hooks within a game tick.
     selection: Option<CachedSelection>,
 }
@@ -907,6 +905,36 @@ fn load_config() -> std::result::Result<Config, String> {
 
 fn load_config_for(game: &Game<'_>) -> std::result::Result<Config, String> {
     let mut config = load_config()?;
+    sync_shape_from_setting(game, &mut config);
+    Ok(config)
+}
+
+// native_data_dir is shared by the window, the integrated server thread and a LAN host.
+// A per-player key lets the UI/keybind and authoritative mining hook observe the same state.
+fn activation_setting_key(actor: Actor) -> String {
+    format!(
+        "active_{:08x}_{:08x}_{:08x}_{:08x}",
+        actor[0] as u32,
+        actor[1] as u32,
+        actor[2] as u32,
+        actor[3] as u32,
+    )
+}
+
+fn is_active(game: &Game<'_>, actor: Actor) -> bool {
+    game.native_setting("veinminer", &activation_setting_key(actor))
+        .is_some_and(|value| matches!(value.trim(), "true" | "1" | "on"))
+}
+
+fn set_active(game: &Game<'_>, actor: Actor, active: bool) {
+    game.native_set_setting(
+        "veinminer",
+        &activation_setting_key(actor),
+        if active { "true" } else { "false" },
+    );
+}
+
+fn sync_shape_from_setting(game: &Game<'_>, config: &mut Config) {
     if let Some(shape) = game
         .native_setting("veinminer", "shape")
         .as_deref()
@@ -914,7 +942,6 @@ fn load_config_for(game: &Game<'_>) -> std::result::Result<Config, String> {
     {
         config.settings.shape = shape;
     }
-    Ok(config)
 }
 
 struct Native<'g, 'r> {
@@ -1099,8 +1126,7 @@ impl Host for PreviewNative<'_, '_> {
             actor: self.actor,
             name: self.game.lan_acting_name.as_deref().unwrap_or(super::chat::PLAYER_NAME).to_owned(),
             tick: self.game.world.game_time,
-            survival: self.game.remote.is_none()
-                && self.game.player.is_some()
+            survival: self.game.player.is_some()
                 && self.game.may_build()
                 && !self.game.creative,
             sneaking: self.game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft),
@@ -1173,7 +1199,7 @@ fn refresh_selection(game: &Game<'_>, state: &mut State) -> Option<CachedSelecti
         Some(guest) => horizon_client::lan::playerdata::uuid_ints(guest),
         None => game.level.player_uuid?,
     };
-    if !state.active.get(&actor).copied().unwrap_or(false) {
+    if !is_active(game, actor) {
         state.selection = None;
         return None;
     }
@@ -1188,6 +1214,9 @@ fn refresh_selection(game: &Game<'_>, state: &mut State) -> Option<CachedSelecti
             config.settings.enabled = false;
             config
         }));
+    }
+    if let Some(config) = state.config.as_mut() {
+        sync_shape_from_setting(game, config);
     }
 
     let mut host = PreviewNative { game, actor, active: true };
@@ -1272,7 +1301,7 @@ impl Game<'_> {
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("toggle"));
         let actor = self.acting_player_uuid();
         with_state(self, |game, state| {
-            let was_active = state.active.get(&actor).copied().unwrap_or(false);
+            let was_active = is_active(game, actor);
             let active = if toggle {
                 if pressed { !was_active } else { was_active }
             } else {
@@ -1281,7 +1310,8 @@ impl Game<'_> {
             if active == was_active {
                 return;
             }
-            state.active.insert(actor, active);
+            set_active(game, actor, active);
+            state.selection = None;
             game.native_chat(if active { "VeinMiner: ON" } else { "VeinMiner: OFF" });
         });
     }
@@ -1293,7 +1323,7 @@ impl Game<'_> {
         }
         let actor = self.acting_player_uuid();
         with_state(self, |game, state| {
-            if !state.active.get(&actor).copied().unwrap_or(false) {
+            if !is_active(game, actor) {
                 return;
             }
             if state.config.is_none() {
@@ -1328,7 +1358,10 @@ impl Game<'_> {
                 }));
             }
             let actor = game.acting_player_uuid();
-            let active = state.active.get(&actor).copied().unwrap_or(false);
+            let active = is_active(game, actor);
+            if let Some(config) = state.config.as_mut() {
+                sync_shape_from_setting(game, config);
+            }
             let shape = state.config.as_ref().unwrap().settings.shape;
             let mode = if game
                 .native_setting(ID, "key_mode")
@@ -1354,8 +1387,8 @@ impl Game<'_> {
             0 => {
                 with_state(self, |game, state| {
                     let actor = game.acting_player_uuid();
-                    let active = !state.active.get(&actor).copied().unwrap_or(false);
-                    state.active.insert(actor, active);
+                    let active = !is_active(game, actor);
+                    set_active(game, actor, active);
                     state.selection = None;
                     game.native_chat(if active { "VeinMiner: ON" } else { "VeinMiner: OFF" });
                 });
@@ -1492,10 +1525,13 @@ impl Game<'_> {
                 game.clip_ray(origin, direction, game.block_reach).filter(|hit| hit.pos == pos)
             });
             let face = hit.map(|hit| hit.face);
+            if let Some(config) = state.config.as_mut() {
+                sync_shape_from_setting(game, config);
+            }
             let config = state.config.as_ref().unwrap();
             let drop_mode = config.settings.drop_mode;
             let actor = game.acting_player_uuid();
-            let active = state.active.get(&actor).copied().unwrap_or(false);
+            let active = is_active(game, actor);
             state
                 .runtime
                 .mine_with_face(
@@ -1533,6 +1569,9 @@ impl Game<'_> {
                     config
                 }));
             }
+            if let Some(config) = state.config.as_mut() {
+                sync_shape_from_setting(self, config);
+            }
             let config = state.config.as_ref().unwrap();
             let action = seed.as_ref().filter(|block| block.breakable).and_then(|block| {
                 if config.settings.shape == Shape::Shapeless {
@@ -1545,7 +1584,7 @@ impl Game<'_> {
             });
             let action = action.filter(|(settings, _)| {
                 settings.enabled
-                    && state.active.get(&player.actor).copied().unwrap_or(false)
+                    && is_active(self, player.actor)
                     && settings.harvest_time_per_block_modifier_enabled
                     && player.survival
                     && state.runtime.enabled(player.actor)
@@ -1576,7 +1615,7 @@ impl Game<'_> {
             let message = match args.as_slice() {
                 [] | ["status"] => format!(
                     "Veinminer: {} | Shape: {} | Drops: {} | Tool safety: {} | Food: {} | Zero hunger: {} | Harvest speed: {}",
-                    if state.active.get(&actor).copied().unwrap_or(false) && state.runtime.enabled(actor) { "on" } else { "off" },
+                    if is_active(game, actor) && state.runtime.enabled(actor) { "on" } else { "off" },
                     state.config.as_ref().map_or("Shapeless", |c| c.settings.shape.label()),
                     state.config.as_ref().map_or("Together", |c| c.settings.drop_mode.label()),
                     if state.config.as_ref().is_none_or(|c| c.settings.prevent_tool_breaking) { "on" } else { "off" },
@@ -1727,13 +1766,14 @@ impl Game<'_> {
                     format!("VeinMiner harvest speed modifier: {}", if enabled { "on" } else { "off" })
                 }
                 ["toggle"] | ["on"] | ["off"] => {
-                    let current = state.active.get(&actor).copied().unwrap_or(false);
+                    let current = is_active(game, actor);
                     let on = match args[0] {
                         "on" => true,
                         "off" => false,
                         _ => !current,
                     };
-                    state.active.insert(actor, on);
+                    set_active(game, actor, on);
+                    state.selection = None;
                     format!("Veinminer: {}", if on { "on" } else { "off" })
                 }
                 ["reload"] => {
