@@ -15,7 +15,8 @@ impl Game<'_> {
         &self,
         camera: glam::DVec3,
         alpha: f64,
-        lines: &mut Vec<gizmos::Line>,
+        _lines: &mut Vec<gizmos::Line>,
+        on_top: &mut Vec<gizmos::Line>,
     ) -> Vec<dynamic_light::Colored> {
         let mut particle_lights = self
             .renderer
@@ -58,14 +59,25 @@ impl Game<'_> {
                     + (at[2] - player.z).powi(2)
                     <= 1024.0
         };
+        // A tunnel can legitimately extend farther than 32 blocks from the player.
+        // Keep rim range separate from the shorter dynamic-light range.
+        let close_rim = |at: [f64; 3]| {
+            at.iter().all(|v| v.is_finite())
+                && (at[0] - player.x).powi(2)
+                    + (at[1] - player.y).powi(2)
+                    + (at[2] - player.z).powi(2)
+                    <= 16384.0
+        };
+        const MAX_RIMS: usize = 64;
+        const MAX_EDGES: usize = MAX_RIMS * 24;
         let mut edges = 0;
-        for rim in rims.into_iter().take(8) {
+        for rim in rims.into_iter().take(MAX_RIMS) {
             let pos = rim.pos;
             let state = self.world.block(pos[0], pos[1], pos[2]);
-            if edges >= 256
+            if edges >= MAX_EDGES
                 || !rim.width.is_finite()
                 || !(0.5..=4.0).contains(&rim.width)
-                || !close(pos.map(|v| f64::from(v) + 0.5))
+                || !close_rim(pos.map(|v| f64::from(v) + 0.5))
                 || !rim_target_valid(
                     self.world
                         .chunks
@@ -94,7 +106,7 @@ impl Game<'_> {
             } else {
                 facts.outline_edges.as_ref()
             };
-            for edge in segments.iter().take(256 - edges) {
+            for edge in segments.iter().take(MAX_EDGES - edges) {
                 let point = |end: usize| {
                     std::array::from_fn(|i| {
                         let v = edge[i + 3 * end];
@@ -105,10 +117,11 @@ impl Game<'_> {
                         }
                     })
                 };
-                lines.push(gizmos::Line {
+                // X-ray selection: draw in the on-top pass, with partial opacity.
+                on_top.push(gizmos::Line {
                     start: point(0),
                     end: point(1),
-                    color: rim.argb,
+                    color: (rim.argb & 0x00ff_ffff) | ((rim.argb >> 1) & 0x7f00_0000),
                     width: rim.width,
                 });
                 edges += 1;

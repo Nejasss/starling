@@ -1266,10 +1266,25 @@ fn refresh_selection(game: &Game<'_>, state: &mut State) -> Option<CachedSelecti
         return Some(cached.clone());
     }
 
-    let positions = engine::preview_with_face(&host, hit.pos, &targets, &settings, hit.face)
-        .into_iter()
-        .map(|selected| selected.position)
-        .collect();
+    let mut positions: Vec<_> = engine::preview_with_face(
+        &host, hit.pos, &targets, &settings, hit.face,
+    )
+    .into_iter()
+    .map(|selected| selected.position)
+    .collect();
+    // The origin block is mined first. Apply the same durability guard the
+    // mining loop will apply to extra blocks, so the HUD/outline do not
+    // advertise blocks the current tool cannot reach.
+    if settings.decrease_durability
+        && let Some(remaining) = tool.as_ref().and_then(|held| held.remaining)
+    {
+        let visible_limit = if settings.prevent_tool_breaking {
+            remaining.saturating_sub(2).max(1)
+        } else {
+            remaining.max(1)
+        };
+        positions.truncate(visible_limit as usize);
+    }
     let selection = CachedSelection {
         actor,
         origin: hit.pos,
@@ -1436,7 +1451,8 @@ impl Game<'_> {
         &self,
         rims: &mut Vec<horizon_client::mod_api::NativeBlockRim>,
     ) {
-        if self
+        if !self.native_on("veinminer")
+            || self
             .native_setting("veinminer", "show_highlights")
             .is_some_and(|value| value.trim() == "false")
         {
@@ -1448,8 +1464,8 @@ impl Game<'_> {
             refresh_selection(self, state)
         });
         if let Some(selection) = selection {
-            // Horizon's frame renderer accepts at most eight depth-tested block rims.
-            for pos in selection.positions.into_iter().take(8) {
+            // Match the 64-block default chain limit; the renderer keeps a bounded budget.
+            for pos in selection.positions.into_iter().take(64) {
                 rims.push(horizon_client::mod_api::NativeBlockRim {
                     pos,
                     argb: 0xFFF9FFFE,
@@ -1544,6 +1560,9 @@ impl Game<'_> {
         })
     }
     pub(super) fn veinminer_harvest_speed_modifier(&self) -> f32 {
+        if !self.native_on("veinminer") {
+            return 1.0;
+        }
         let Some(hit) = self.pick() else { return 1.0; };
         let origin = hit.pos;
         let face = hit.face;
