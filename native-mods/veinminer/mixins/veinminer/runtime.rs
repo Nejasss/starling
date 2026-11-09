@@ -288,6 +288,8 @@ pub struct Tool {
 pub trait Host {
     type Error;
     fn player(&mut self) -> Player;
+    // Cardinal horizontal direction the player is facing (used for vertical-hit staircases).
+    fn horizontal_forward(&self) -> Position;
     // None means unloaded/outside build bounds. This must never load a chunk.
     fn block(&self, position: Position) -> Option<Block>;
     fn tool(&self) -> Option<Tool>;
@@ -369,101 +371,145 @@ fn face_axis(face: Position) -> Position {
     }
 }
 
-fn add_offset(
+// Hit.face is the outward normal of the face the ray entered. Liteminer's
+// walkers advance in the opposite direction: away from the player and through
+// the block, not back toward the player.
+fn inward_direction(face: Position) -> Position {
+    let normal = face_axis(face);
+    [-normal[0], -normal[1], -normal[2]]
+}
+
+pub fn horizontal_direction_from_yaw(yaw: f32) -> Position {
+    // Direction::fromYRot: nearest horizontal cardinal, including exact 45° ties.
+    let quadrant = (f64::from(yaw) / 90.0 + 0.5).floor() as i32 & 3;
+    match quadrant {
+        0 => [0, 0, 1],
+        1 => [-1, 0, 0],
+        2 => [0, 0, -1],
+        _ => [1, 0, 0],
+    }
+}
+
+fn offset(position: Position, delta: Position) -> Option<Position> {
+    Some([
+        position[0].checked_add(delta[0])?,
+        position[1].checked_add(delta[1])?,
+        position[2].checked_add(delta[2])?,
+    ])
+}
+
+fn candidate_block<H: Host>(host: &H, position: Position, settings: &Settings) -> Option<Block> {
+    let block = host.block(position)?;
+    if !block.breakable || settings.need_correct_tool && !host.can_harvest(&block) {
+        return None;
+    }
+    Some(block)
+}
+
+fn push_candidate<H: Host>(
+    host: &H,
+    position: Position,
+    settings: &Settings,
+    output: &mut Vec<Hit>,
+    seen: &mut BTreeSet<Position>,
+) -> bool {
+    let Some(block) = candidate_block(host, position, settings) else {
+        return false;
+    };
+    if seen.insert(position) {
+        output.push(Hit { position, block });
+    }
+    true
+}
+
+fn geometric_preview<H: Host>(
+    host: &H,
     origin: Position,
-    forward: Position,
-    distance: i32,
-    lateral: Position,
-    width: i32,
-    vertical: Position,
-) -> Option<Position> {
-    let mut result = origin;
-    for axis in 0..3 {
-        let step = forward[axis]
-            .checked_mul(distance)?
-            .checked_add(lateral[axis].checked_mul(width)?)?
-            .checked_add(vertical[axis])?;
-        result[axis] = result[axis].checked_add(step)?;
-    }
-    Some(result)
-}
-
-fn push_position(output: &mut Vec<Position>, seen: &mut BTreeSet<Position>, p: Option<Position>, limit: usize) {
-    if output.len() >= limit {
-        return;
-    }
-    if let Some(p) = p {
-        if seen.insert(p) {
-            output.push(p);
-        }
-    }
-}
-
-fn geometric_positions(origin: Position, face: Position, shape: Shape, limit: usize) -> Vec<Position> {
+    settings: &Settings,
+    face: Position,
+    horizontal_forward: Position,
+) -> Vec<Hit> {
+    let limit = settings.max_chain;
     let mut output = Vec::with_capacity(limit.min(256));
     let mut seen = BTreeSet::new();
-    push_position(&mut output, &mut seen, Some(origin), limit);
-    if limit <= 1 {
+    if !push_candidate(host, origin, settings, &mut output, &mut seen) || limit <= 1 {
         return output;
     }
-    let normal = face_axis(face);
-    match shape {
+
+    let inward = inward_direction(face);
+    match settings.shape {
         Shape::Shapeless => {}
         Shape::ThreeByThree => {
-            let (u, v) = if normal[0] != 0 {
-                ([0, 1, 0], [0, 0, 1])
-            } else if normal[1] != 0 {
-                ([1, 0, 0], [0, 0, 1])
+            // Match Liteminer's 3x3 plane: horizontal when the ray hit a top
+            // or bottom face; otherwise vertical, perpendicular to the ray.
+            let offsets: Vec<Position> = if inward[1] != 0 {
+                vec![
+                    [0, 0, -1], [1, 0, -1], [-1, 0, -1],
+                    [1, 0, 0], [-1, 0, 0],
+                    [0, 0, 1], [1, 0, 1], [-1, 0, 1],
+                ]
             } else {
-                ([1, 0, 0], [0, 1, 0])
+                // The horizontal vector is the ray direction. Its
+                // counter-clockwise perpendicular defines the left side.
+                let left = [inward[2], 0, -inward[0]];
+                let right = [-left[0], 0, -left[2]];
+                vec![
+                    [left[0], 1, left[2]], [0, 1, 0], [right[0], 1, right[2]],
+                    left, right,
+                    [left[0], -1, left[2]], [0, -1, 0], [right[0], -1, right[2]],
+                ]
             };
-            for (a, b) in [(0, -1), (0, 1), (-1, 0), (1, 0), (-1, -1), (-1, 1), (1, -1), (1, 1)] {
-                let mut p = origin;
-                let mut valid = true;
-                for axis in 0..3 {
-                    let Some(value) = p[axis]
-                        .checked_add(u[axis] * a)
-                        .and_then(|n| n.checked_add(v[axis] * b)) else {
-                        valid = false;
-                        break;
-                    };
-                    p[axis] = value;
+            for delta in offsets {
+                if output.len() >= limit {
+                    break;
                 }
-                if valid {
-                    push_position(&mut output, &mut seen, Some(p), limit);
+                if let Some(position) = offset(origin, delta) {
+                    push_candidate(host, position, settings, &mut output, &mut seen);
                 }
             }
         }
         Shape::Tunnel => {
-            let forward = if normal[1] != 0 { [0, 0, 1] } else { normal };
-            for depth in 1..=limit as i32 {
-                for height in 0..=1 {
-                    push_position(
-                        &mut output,
-                        &mut seen,
-                        add_offset(origin, forward, depth, [0, 0, 0], 0, [0, height, 0]),
-                        limit,
-                    );
-                    if output.len() >= limit { break; }
+            // Liteminer's Small Tunnel is one block wide and advances exactly
+            // one block along the ray. It is not a two-block-high column.
+            let mut cursor = origin;
+            while output.len() < limit {
+                let Some(next) = offset(cursor, inward) else { break; };
+                if !push_candidate(host, next, settings, &mut output, &mut seen) {
+                    break;
                 }
-                if output.len() >= limit { break; }
+                cursor = next;
             }
         }
         Shape::StaircaseUp | Shape::StaircaseDown => {
-            let forward = if normal[1] != 0 { [0, 0, 1] } else { normal };
-            let lateral = [-forward[2], 0, forward[0]];
-            let rise = if shape == Shape::StaircaseUp { 1 } else { -1 };
-            for depth in 1..=limit as i32 {
-                for width in [0, -1, 1] {
-                    push_position(
-                        &mut output,
-                        &mut seen,
-                        add_offset(origin, forward, depth, lateral, width, [0, rise * depth, 0]),
-                        limit,
-                    );
-                    if output.len() >= limit { break; }
+            // When the player targets a top/bottom face, Liteminer uses the
+            // player's horizontal facing direction for staircase progression.
+            let forward = if inward[1] != 0 { horizontal_forward } else { inward };
+            let rise = if settings.shape == Shape::StaircaseUp { 1 } else { -1 };
+            let mut cursor = origin;
+            while output.len() < limit {
+                let candidates: Vec<Position> = if rise > 0 {
+                    vec![cursor, offset(cursor, [0, -1, 0]).unwrap_or(cursor), offset(cursor, [0, 1, 0]).unwrap_or(cursor)]
+                } else {
+                    vec![cursor, offset(cursor, [0, -1, 0]).unwrap_or(cursor), offset(cursor, [0, -2, 0]).unwrap_or(cursor)]
+                };
+                let mut any_valid = false;
+                for position in candidates {
+                    any_valid |= push_candidate(host, position, settings, &mut output, &mut seen);
+                    if output.len() >= limit {
+                        break;
+                    }
                 }
-                if output.len() >= limit { break; }
+                // Liteminer stops when an entire step has no eligible blocks;
+                // it does not skip gaps and resume farther away.
+                if !any_valid || output.len() >= limit {
+                    break;
+                }
+                let Some(mut next) = offset(cursor, forward) else { break; };
+                next[1] = match next[1].checked_add(rise) {
+                    Some(value) => value,
+                    None => break,
+                };
+                cursor = next;
             }
         }
     }
@@ -486,21 +532,22 @@ pub fn preview_with_face<H: Host>(
     settings: &Settings,
     face: Position,
 ) -> Vec<Hit> {
+    preview_with_orientation(host, origin, targets, settings, Some(face))
+}
+
+fn preview_with_orientation<H: Host>(
+    host: &H,
+    origin: Position,
+    targets: &BTreeSet<String>,
+    settings: &Settings,
+    face: Option<Position>,
+) -> Vec<Hit> {
     if settings.validate().is_err() {
         return Vec::new();
     }
     if settings.shape != Shape::Shapeless {
-        let positions = geometric_positions(origin, face, settings.shape, settings.max_chain);
-        return positions
-            .into_iter()
-            .filter_map(|position| {
-                let block = host.block(position)?;
-                if !block.breakable || settings.need_correct_tool && !host.can_harvest(&block) {
-                    return None;
-                }
-                Some(Hit { position, block })
-            })
-            .collect();
+        let Some(face) = face else { return Vec::new(); };
+        return geometric_preview(host, origin, settings, face, host.horizontal_forward());
     }
 
     let Some(origin_block) = host.block(origin) else { return Vec::new(); };
@@ -566,7 +613,7 @@ impl Runtime {
         config: &Config,
         origin: Position,
     ) -> Result<Report, H::Error> {
-        self.mine_with_face(host, config, origin, [0, 1, 0])
+        self.mine_with_face(host, config, origin, Some([0, 1, 0]))
     }
 
     pub fn mine_with_face<H: Host>(
@@ -574,7 +621,7 @@ impl Runtime {
         host: &mut H,
         config: &Config,
         origin: Position,
-        face: Position,
+        face: Option<Position>,
     ) -> Result<Report, H::Error> {
         let player = host.player();
         let tool = host.tool();
@@ -602,7 +649,7 @@ impl Runtime {
                     .is_none_or(|end| player.tick >= *end)
         });
         let hits = if let Some((settings, targets)) = &action {
-            preview_with_face(host, origin, targets, settings, face)
+            preview_with_orientation(host, origin, targets, settings, face)
         } else {
             Vec::new()
         };
@@ -756,6 +803,9 @@ impl Host for Native<'_, '_> {
             growth,
         })
     }
+    fn horizontal_forward(&self) -> Position {
+        engine::horizontal_direction_from_yaw(self.game.interaction_rotation().0)
+    }
     fn tool(&self) -> Option<Tool> {
         let stack = self.game.held()?;
         let max = self
@@ -826,7 +876,14 @@ impl Game<'_> {
                     config
                 }));
             }
-            let face = game.pick().map(|hit| hit.face).unwrap_or([0, 1, 0]);
+            // Prefer the hit that actually matches the block being mined.
+            // tick_hit/forced_hit can briefly refer to a stale target; retry
+            // the current aim ray before giving up on geometric expansion.
+            let hit = game.pick().filter(|hit| hit.pos == pos).or_else(|| {
+                let (origin, direction) = game.aim()?;
+                game.clip_ray(origin, direction, game.block_reach).filter(|hit| hit.pos == pos)
+            });
+            let face = hit.map(|hit| hit.face);
             let config = state.config.as_ref().unwrap();
             state
                 .runtime
@@ -924,6 +981,7 @@ struct World {
     blocks: BTreeMap<Position, Block>,
     player: Player,
     tool: Option<Tool>,
+    forward: Position,
     food: bool,
     harvest: bool,
     calls: Vec<(Position, bool)>,
@@ -952,6 +1010,7 @@ impl World {
                 item: "minecraft:iron_pickaxe".into(),
                 remaining: Some(1000),
             }),
+            forward: [0, 0, 1],
             food: true,
             harvest: true,
             calls: Vec::new(),
@@ -983,6 +1042,9 @@ impl Host for World {
     }
     fn tool(&self) -> Option<Tool> {
         self.tool.clone()
+    }
+    fn horizontal_forward(&self) -> Position {
+        self.forward
     }
     fn can_harvest(&self, _: &Block) -> bool {
         self.harvest
@@ -1251,20 +1313,81 @@ fn three_by_three_shape_uses_clicked_face_plane_and_includes_mixed_blocks() {
 }
 
 #[test]
-fn tunnel_and_staircase_walkers_are_bounded_and_directional() {
-    let mut w = World::new(&[[0, 0, 0], [1, 0, 0], [1, 1, 0], [2, 0, 0]]);
+fn tunnel_is_one_block_wide_and_follows_the_ray_not_the_player_backwards() {
+    let points = [
+        [0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 0, 0],
+        [1, 1, 0], [2, 1, 0],
+    ];
+    let w = World::new(&points);
     let mut c = Config::default();
     c.settings.shape = Shape::Tunnel;
-    c.settings.max_chain = 4;
-    assert_eq!(preview_with_face(&w, [0, 0, 0], &BTreeSet::new(), &c.settings, [1, 0, 0]).len(), 4);
+    c.settings.max_chain = 8;
+    let hits = preview_with_face(&w, [0, 0, 0], &BTreeSet::new(), &c.settings, [-1, 0, 0]);
+    let positions: BTreeSet<_> = hits.into_iter().map(|hit| hit.position).collect();
+    assert_eq!(positions, BTreeSet::from([[0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 0, 0]]));
+}
 
-    w = World::new(&[[0, 0, 0], [1, 1, 0], [2, 2, 0]]);
-    c.settings.shape = Shape::StaircaseUp;
+#[test]
+fn tunnel_follows_vertical_face_instead_of_turning_sideways() {
+    let w = World::new(&[[0, 0, 0], [0, -1, 0], [0, -2, 0], [0, 0, 1], [1, 0, 0]]);
+    let mut c = Config::default();
+    c.settings.shape = Shape::Tunnel;
     c.settings.max_chain = 5;
-    assert_eq!(preview_with_face(&w, [0, 0, 0], &BTreeSet::new(), &c.settings, [1, 0, 0]).len(), 3);
+    let hits = preview_with_face(&w, [0, 0, 0], &BTreeSet::new(), &c.settings, [0, 1, 0]);
+    let positions: BTreeSet<_> = hits.into_iter().map(|hit| hit.position).collect();
+    assert_eq!(positions, BTreeSet::from([[0, 0, 0], [0, -1, 0], [0, -2, 0]]));
+}
+
+#[test]
+fn staircase_up_and_down_follow_forward_steps_with_liteminer_vertical_columns() {
+    let up_points = [
+        [0, 0, 0], [0, -1, 0], [0, 1, 0],
+        [1, 0, 0], [1, 1, 0], [1, 2, 0],
+        [2, 1, 0], [2, 2, 0], [2, 3, 0],
+    ];
+    let mut w = World::new(&up_points);
+    let mut c = Config::default();
+    c.settings.shape = Shape::StaircaseUp;
+    c.settings.max_chain = 9;
+    let hits = preview_with_face(&w, [0, 0, 0], &BTreeSet::new(), &c.settings, [-1, 0, 0]);
+    let positions: BTreeSet<_> = hits.into_iter().map(|hit| hit.position).collect();
+    assert_eq!(positions, BTreeSet::from(up_points));
+
+    let down_points = [
+        [0, 0, 0], [0, -1, 0], [0, -2, 0],
+        [1, -1, 0], [1, -2, 0], [1, -3, 0],
+        [2, -2, 0], [2, -3, 0], [2, -4, 0],
+    ];
+    w = World::new(&down_points);
     c.settings.shape = Shape::StaircaseDown;
-    w = World::new(&[[0, 0, 0], [1, -1, 0], [2, -2, 0]]);
-    assert_eq!(preview_with_face(&w, [0, 0, 0], &BTreeSet::new(), &c.settings, [1, 0, 0]).len(), 3);
+    let hits = preview_with_face(&w, [0, 0, 0], &BTreeSet::new(), &c.settings, [-1, 0, 0]);
+    let positions: BTreeSet<_> = hits.into_iter().map(|hit| hit.position).collect();
+    assert_eq!(positions, BTreeSet::from(down_points));
+}
+
+#[test]
+fn horizontal_direction_from_yaw_matches_cardinal_player_facing() {
+    assert_eq!(horizontal_direction_from_yaw(0.0), [0, 0, 1]);
+    assert_eq!(horizontal_direction_from_yaw(90.0), [-1, 0, 0]);
+    assert_eq!(horizontal_direction_from_yaw(180.0), [0, 0, -1]);
+    assert_eq!(horizontal_direction_from_yaw(270.0), [1, 0, 0]);
+    assert_eq!(horizontal_direction_from_yaw(-90.0), [1, 0, 0]);
+}
+
+#[test]
+fn vertical_staircase_hit_uses_player_horizontal_facing() {
+    let points = [
+        [0, 0, 0], [0, -1, 0], [0, 1, 0],
+        [-1, 0, 0], [-1, 1, 0], [-1, 2, 0],
+    ];
+    let mut w = World::new(&points);
+    w.forward = [-1, 0, 0];
+    let mut c = Config::default();
+    c.settings.shape = Shape::StaircaseUp;
+    c.settings.max_chain = 6;
+    let hits = preview_with_face(&w, [0, 0, 0], &BTreeSet::new(), &c.settings, [0, 1, 0]);
+    let positions: BTreeSet<_> = hits.into_iter().map(|hit| hit.position).collect();
+    assert_eq!(positions, BTreeSet::from(points));
 }
 
 #[test]
