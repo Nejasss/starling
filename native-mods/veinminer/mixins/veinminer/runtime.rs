@@ -1,5 +1,5 @@
 // Native adapter for Horizon 028f60881678a9a0e3e198f693a82858fa475c76.
-use super::{Game, Result};
+use super::{Game, Result, Vec3};
 mod engine {
     // Original Rust implementation of the documented vein-mining behavior.
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,22 @@ impl Shape {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DropMode {
+    #[default]
+    Together,
+    EachBlock,
+}
+impl DropMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Together => "Together",
+            Self::EachBlock => "Each Block",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Settings {
@@ -40,6 +56,8 @@ pub struct Settings {
     pub need_correct_tool: bool,
     pub search_radius: i32,
     pub decrease_durability: bool,
+    pub prevent_tool_breaking: bool,
+    pub drop_mode: DropMode,
     pub hunger_per_block: f32,
     pub separate_group_mining: bool,
     pub permission_restricted: bool,
@@ -57,6 +75,8 @@ impl Default for Settings {
             need_correct_tool: true,
             search_radius: 1,
             decrease_durability: true,
+            prevent_tool_breaking: true,
+            drop_mode: DropMode::Together,
             hunger_per_block: 0.0,
             separate_group_mining: false,
             permission_restricted: false,
@@ -93,6 +113,7 @@ pub struct Overrides {
     pub need_correct_tool: Option<bool>,
     pub search_radius: Option<i32>,
     pub decrease_durability: Option<bool>,
+    pub prevent_tool_breaking: Option<bool>,
     pub hunger_per_block: Option<f32>,
     pub separate_group_mining: Option<bool>,
     pub permission_restricted: Option<bool>,
@@ -107,6 +128,7 @@ impl Overrides {
             need_correct_tool,
             search_radius,
             decrease_durability,
+            prevent_tool_breaking,
             hunger_per_block,
             separate_group_mining,
             permission_restricted
@@ -680,13 +702,14 @@ impl Runtime {
                 report.stopped = true;
                 break;
             }
-            if settings.decrease_durability
+            if (settings.prevent_tool_breaking
+                && settings.decrease_durability
                 && host
                     .tool()
                     .as_ref()
                     .and_then(|t| t.remaining)
-                    .is_some_and(|n| n <= 1)
-                || settings.hunger_per_block > 0.0 && !host.has_food()
+                    .is_some_and(|remaining| remaining <= 2))
+                || (settings.hunger_per_block > 0.0 && !host.has_food())
             {
                 report.stopped = true;
                 break;
@@ -711,7 +734,7 @@ impl Runtime {
 }
 
 }
-use engine::{Block, Config, Host, Player, Position, Runtime, Shape, Tool};
+use engine::{Block, Config, DropMode, Host, Player, Position, Runtime, Shape, Tool};
 
 #[derive(Default)]
 pub(super) struct State {
@@ -756,6 +779,8 @@ fn load_config() -> std::result::Result<Config, String> {
 
 struct Native<'g, 'r> {
     game: &'g mut Game<'r>,
+    origin: Position,
+    drop_mode: DropMode,
 }
 impl Host for Native<'_, '_> {
     type Error = Box<dyn std::error::Error>;
@@ -846,6 +871,17 @@ impl Host for Native<'_, '_> {
     }
     fn mine(&mut self, p: Position, preserve: bool) -> Result<bool> {
         let before = self.block(p);
+        let together = self.drop_mode == DropMode::Together && p != self.origin;
+        let dropped_before = self.game.dropped.len();
+        let orbs_before: Vec<(u32, (u32, u32, u32))> = if together {
+            self.game
+                .orbs
+                .iter()
+                .map(|orb| (orb.id, (orb.count, orb.value, orb.age)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let held = preserve.then(|| self.game.inventory[self.game.selected].clone());
         // Temporarily remove pre-existing damage, then restore damage (and a tool
         // destroyed by this one operation) without changing other mining effects.
@@ -861,6 +897,25 @@ impl Host for Native<'_, '_> {
             }
         }
         result?;
+        if together {
+            let target = self.origin.map(|coordinate| f64::from(coordinate) + 0.5);
+            for item in self.game.dropped.iter_mut().skip(dropped_before) {
+                item.position = Vec3::new(target[0], target[1], target[2]);
+                item.previous = Vec3::new(target[0], target[1], target[2]);
+                item.needs_sync = true;
+            }
+            for orb in &mut self.game.orbs {
+                let previous = orbs_before
+                    .iter()
+                    .find(|(id, _)| *id == orb.id)
+                    .map(|(_, state)| *state);
+                let current = (orb.count, orb.value, orb.age);
+                if previous != Some(current) {
+                    orb.position = Vec3::new(target[0], target[1], target[2]);
+                    orb.previous = Vec3::new(target[0], target[1], target[2]);
+                }
+            }
+        }
         Ok(before.is_some() && self.block(p) != before)
     }
     fn exhaust(&mut self, amount: f32) {
@@ -891,9 +946,15 @@ impl Game<'_> {
             });
             let face = hit.map(|hit| hit.face);
             let config = state.config.as_ref().unwrap();
+            let drop_mode = config.settings.drop_mode;
             state
                 .runtime
-                .mine_with_face(&mut Native { game }, config, pos, face)
+                .mine_with_face(
+                    &mut Native { game, origin: pos, drop_mode },
+                    config,
+                    pos,
+                    face,
+                )
                 .map(|_| ())
         })
     }
@@ -907,9 +968,11 @@ impl Game<'_> {
             let actor = game.acting_player_uuid();
             let message = match args.as_slice() {
                 [] | ["status"] => format!(
-                    "Veinminer: {} | Shape: {}",
+                    "Veinminer: {} | Shape: {} | Drops: {} | Tool safety: {}",
                     if state.runtime.enabled(actor) { "on" } else { "off" },
-                    state.config.as_ref().map_or("Shapeless", |c| c.settings.shape.label())
+                    state.config.as_ref().map_or("Shapeless", |c| c.settings.shape.label()),
+                    state.config.as_ref().map_or("Together", |c| c.settings.drop_mode.label()),
+                    if state.config.as_ref().is_none_or(|c| c.settings.prevent_tool_breaking) { "on" } else { "off" }
                 ),
                 ["shape", name] => {
                     let shape = match *name {
@@ -937,6 +1000,52 @@ impl Game<'_> {
                     state.config.as_mut().unwrap().settings.shape = shape;
                     format!("VeinMiner shape: {}", shape.label())
                 },
+                ["drops", name] => {
+                    let drop_mode = match *name {
+                        "together" => DropMode::Together,
+                        "each" | "each_block" => DropMode::EachBlock,
+                        _ => {
+                            game.command_failure(horizon_client::text::Text::literal(
+                                "Usage: /veinminer drops [together|each]",
+                            ));
+                            return Some(false);
+                        }
+                    };
+                    if state.config.is_none() {
+                        match load_config() {
+                            Ok(config) => state.config = Some(config),
+                            Err(error) => {
+                                game.command_failure(horizon_client::text::Text::literal(error));
+                                return Some(false);
+                            }
+                        }
+                    }
+                    state.config.as_mut().unwrap().settings.drop_mode = drop_mode;
+                    format!("VeinMiner drops: {}", drop_mode.label())
+                }
+                ["tool-safety", mode] => {
+                    let enabled = match *mode {
+                        "on" => true,
+                        "off" => false,
+                        _ => {
+                            game.command_failure(horizon_client::text::Text::literal(
+                                "Usage: /veinminer tool-safety [on|off]",
+                            ));
+                            return Some(false);
+                        }
+                    };
+                    if state.config.is_none() {
+                        match load_config() {
+                            Ok(config) => state.config = Some(config),
+                            Err(error) => {
+                                game.command_failure(horizon_client::text::Text::literal(error));
+                                return Some(false);
+                            }
+                        }
+                    }
+                    state.config.as_mut().unwrap().settings.prevent_tool_breaking = enabled;
+                    format!("VeinMiner tool safety: {}", if enabled { "on" } else { "off" })
+                }
                 ["toggle"] | ["on"] | ["off"] => {
                     let on = match args[0] {
                         "on" => true,
@@ -966,7 +1075,7 @@ impl Game<'_> {
                 }
                 _ => {
                     game.command_failure(horizon_client::text::Text::literal(
-                        "Usage: /veinminer [status|toggle|on|off|reload|shape <shapeless|tunnel|3x3|up|down>]",
+                        "Usage: /veinminer [status|toggle|on|off|reload|shape <shapeless|tunnel|3x3|up|down>|drops <together|each>|tool-safety <on|off>]",
                     ));
                     return Some(false);
                 }
@@ -1282,6 +1391,48 @@ fn geometric_three_by_three_can_run_on_consecutive_breaks_without_cooldown() {
         .unwrap();
     assert_eq!((second.planned, second.extra_broken), (9, 8));
     assert_eq!(world.calls.len(), 18);
+}
+
+#[test]
+fn liteminer_drop_mode_defaults_to_together_and_round_trips_each_block() {
+    let defaults = Config::default();
+    assert_eq!(defaults.settings.drop_mode, DropMode::Together);
+    assert!(defaults.settings.prevent_tool_breaking);
+
+    let mut config = Config::default();
+    config.settings.drop_mode = DropMode::EachBlock;
+    let encoded = serde_json::to_string(&config).unwrap();
+    let decoded = Config::from_json(&encoded).unwrap();
+    assert_eq!(decoded.settings.drop_mode, DropMode::EachBlock);
+}
+
+#[test]
+fn prevent_tool_breaking_matches_liteminer_two_durability_buffer() {
+    // The origin consumes one point first. With three points at entry, two
+    // remain; Liteminer stops before damaging the tool on an extra block.
+    let mut world = World::new(&[[0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 0, 0]]);
+    world.tool.as_mut().unwrap().remaining = Some(3);
+    let report = mine(&mut world, &Config::default());
+    assert_eq!(report.extra_broken, 0);
+    assert!(report.stopped);
+    assert_eq!(world.tool.unwrap().remaining, Some(2));
+
+    // With two points at entry, the origin leaves one; safety still blocks extras.
+    let mut world = World::new(&[[0, 0, 0], [1, 0, 0]]);
+    world.tool.as_mut().unwrap().remaining = Some(2);
+    let report = mine(&mut world, &Config::default());
+    assert_eq!(report.extra_broken, 0);
+    assert!(report.stopped);
+    assert_eq!(world.tool.unwrap().remaining, Some(1));
+
+    // Turning safety off allows the secondary block to consume the final point.
+    let mut world = World::new(&[[0, 0, 0], [1, 0, 0], [2, 0, 0]]);
+    world.tool.as_mut().unwrap().remaining = Some(2);
+    let mut config = Config::default();
+    config.settings.prevent_tool_breaking = false;
+    let report = mine(&mut world, &config);
+    assert_eq!(report.extra_broken, 1);
+    assert!(world.tool.is_none());
 }
 
 #[test]
