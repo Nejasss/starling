@@ -25,17 +25,16 @@ bindings = [
 
 [[injection]]
 id = "harvest-speed"
-kind = "MODIFY_EXPRESSION_VALUE"
+kind = "MODIFY_VARIABLE"
 target = "horizon_client::game::Game<'_>::tick_mining"
-selector = "self.items().mining_speed(held, &facts.name)"
-require = 1
+variable = { name = "speed", ordinal = 0, at = "STORE" }
+require = 5
 ordinal = 0
 helper = "harvest.rs"
 bindings = [
   { name = "value", ty = "f32", value = "$value" },
   { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
 ]
-
 [[injection]]
 id = "command"
 kind = "HEAD"
