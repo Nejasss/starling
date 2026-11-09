@@ -15,9 +15,11 @@ impl Game<'_> {
         &self,
         camera: glam::DVec3,
         alpha: f64,
-        _lines: &mut Vec<gizmos::Line>,
+        lines: &mut Vec<gizmos::Line>,
         on_top: &mut Vec<gizmos::Line>,
     ) -> Vec<dynamic_light::Colored> {
+        // Preserve the parameter name used by existing native mixin bindings.
+        let _ = lines;
         let mut particle_lights = self
             .renderer
             .as_ref()
