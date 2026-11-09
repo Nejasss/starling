@@ -58,7 +58,13 @@ pub struct Settings {
     pub decrease_durability: bool,
     pub prevent_tool_breaking: bool,
     pub drop_mode: DropMode,
+    /// Legacy alias: when positive, this overrides food_exhaustion.
     pub hunger_per_block: f32,
+    pub food_exhaustion_enabled: bool,
+    pub food_exhaustion: f32,
+    pub allow_vein_mining_at_zero_hunger: bool,
+    pub harvest_time_per_block_modifier_enabled: bool,
+    pub harvest_time_per_block_modifier: f32,
     pub separate_group_mining: bool,
     pub permission_restricted: bool,
     pub shape: Shape,
@@ -78,6 +84,11 @@ impl Default for Settings {
             prevent_tool_breaking: true,
             drop_mode: DropMode::Together,
             hunger_per_block: 0.0,
+            food_exhaustion_enabled: true,
+            food_exhaustion: 0.2,
+            allow_vein_mining_at_zero_hunger: true,
+            harvest_time_per_block_modifier_enabled: false,
+            harvest_time_per_block_modifier: 2.0,
             separate_group_mining: false,
             permission_restricted: false,
             shape: Shape::Shapeless,
@@ -100,7 +111,23 @@ impl Settings {
         if !self.hunger_per_block.is_finite() || !(0.0..=40.0).contains(&self.hunger_per_block) {
             return Err("hungerPerBlock must be finite and 0..40".into());
         }
+        if !self.food_exhaustion.is_finite() || !(0.0..=1.0).contains(&self.food_exhaustion) {
+            return Err("foodExhaustion must be finite and 0..1".into());
+        }
+        if !self.harvest_time_per_block_modifier.is_finite()
+            || !(1.0..=10.0).contains(&self.harvest_time_per_block_modifier)
+        {
+            return Err("harvestTimePerBlockModifier must be finite and 1..10".into());
+        }
         Ok(())
+    }
+    pub fn exhaustion_per_block(&self) -> f32 {
+        if self.hunger_per_block > 0.0 { self.hunger_per_block } else { self.food_exhaustion }
+    }
+    pub fn requires_food_for_vein_mining(&self) -> bool {
+        self.food_exhaustion_enabled
+            && self.exhaustion_per_block() > 0.0
+            && !self.allow_vein_mining_at_zero_hunger
     }
 }
 
@@ -115,6 +142,11 @@ pub struct Overrides {
     pub decrease_durability: Option<bool>,
     pub prevent_tool_breaking: Option<bool>,
     pub hunger_per_block: Option<f32>,
+    pub food_exhaustion_enabled: Option<bool>,
+    pub food_exhaustion: Option<f32>,
+    pub allow_vein_mining_at_zero_hunger: Option<bool>,
+    pub harvest_time_per_block_modifier_enabled: Option<bool>,
+    pub harvest_time_per_block_modifier: Option<f32>,
     pub separate_group_mining: Option<bool>,
     pub permission_restricted: Option<bool>,
 }
@@ -130,6 +162,11 @@ impl Overrides {
             decrease_durability,
             prevent_tool_breaking,
             hunger_per_block,
+            food_exhaustion_enabled,
+            food_exhaustion,
+            allow_vein_mining_at_zero_hunger,
+            harvest_time_per_block_modifier_enabled,
+            harvest_time_per_block_modifier,
             separate_group_mining,
             permission_restricted
         );
@@ -316,7 +353,9 @@ pub trait Host {
     fn block(&self, position: Position) -> Option<Block>;
     fn tool(&self) -> Option<Tool>;
     fn can_harvest(&self, block: &Block) -> bool;
+    /// Food-bar level only; saturation does not make a zero food bar nonzero.
     fn has_food(&self) -> bool;
+    fn has_nourishment(&self) -> bool;
     // Must use the game's ordinary player-mining path, never /setblock.
     fn mine(&mut self, position: Position, preserve_durability: bool) -> Result<bool, Self::Error>;
     fn exhaust(&mut self, amount: f32);
@@ -613,6 +652,28 @@ fn preview_with_orientation<H: Host>(
     hits
 }
 
+pub fn selected_block_count<H: Host>(
+    host: &H,
+    origin: Position,
+    targets: &BTreeSet<String>,
+    settings: &Settings,
+    face: Position,
+) -> usize {
+    preview_with_orientation(host, origin, targets, settings, Some(face)).len()
+}
+
+pub fn scaled_harvest_speed_modifier(block_count: usize, modifier: f32) -> f32 {
+    if block_count <= 1 || !modifier.is_finite() {
+        return 1.0;
+    }
+    1.0 / (1.0 + (block_count.saturating_sub(1) as f32 * modifier * 0.1))
+}
+
+pub fn remove_vanilla_extra_block_exhaustion(before: f32, after: f32) -> f32 {
+    let added = (after - before).max(0.0);
+    (after - added.min(0.005)).max(0.0)
+}
+
 #[derive(Default)]
 pub struct Runtime {
     cooldowns: BTreeMap<Actor, i64>,
@@ -628,6 +689,10 @@ impl Runtime {
         } else {
             self.disabled.insert(actor);
         }
+    }
+    pub fn cooldown_ready(&self, actor: Actor, tick: i64, shape: Shape) -> bool {
+        shape != Shape::Shapeless
+            || self.cooldowns.get(&actor).is_none_or(|end| tick >= *end)
     }
     pub fn mine<H: Host>(
         &mut self,
@@ -665,6 +730,7 @@ impl Runtime {
                 && self.enabled(player.actor)
                 && (!settings.must_sneak || player.sneaking)
                 && (!settings.permission_restricted || config.players.contains(&player.name))
+                && (!settings.requires_food_for_vein_mining() || host.has_food())
                 // Keep the legacy cooldown for shapeless veins only. Liteminer geometric
                 // shapes are evaluated once for each player block-break action; applying
                 // this delay makes the next 3x3/tunnel/staircase click break only its origin.
@@ -709,7 +775,6 @@ impl Runtime {
                     .as_ref()
                     .and_then(|t| t.remaining)
                     .is_some_and(|remaining| remaining <= 2))
-                || (settings.hunger_per_block > 0.0 && !host.has_food())
             {
                 report.stopped = true;
                 break;
@@ -726,7 +791,14 @@ impl Runtime {
                 report.stopped = true;
                 break;
             }
-            host.exhaust(settings.hunger_per_block);
+            let exhaustion = if settings.food_exhaustion_enabled {
+                settings.exhaustion_per_block()
+            } else {
+                0.0
+            };
+            if exhaustion > 0.0 && !host.has_nourishment() {
+                host.exhaust(exhaustion);
+            }
             report.extra_broken += 1;
         }
         Ok(report)
@@ -864,14 +936,22 @@ impl Host for Native<'_, '_> {
                 .correct_for_drops(self.game.held(), &block.name)
     }
     fn has_food(&self) -> bool {
-        self.game
-            .player
-            .as_ref()
-            .is_some_and(|p| p.health.food.food > 0 || p.health.food.saturation > 0.0)
+        self.game.player.as_ref().is_some_and(|p| p.health.food.food > 0)
+    }
+    fn has_nourishment(&self) -> bool {
+        self.game.potions.effects.get("farmersdelight:nourishment").is_some()
     }
     fn mine(&mut self, p: Position, preserve: bool) -> Result<bool> {
         let before = self.block(p);
-        let together = self.drop_mode == DropMode::Together && p != self.origin;
+        let extra_block = p != self.origin;
+        // Match Horizon's harvest predicate: failed tool checks add no vanilla exhaustion.
+        let harvest_before = before.as_ref().is_some_and(|block| self.can_harvest(block));
+        let exhaustion_before = if extra_block && harvest_before {
+            self.game.player.as_ref().map(|player| player.health.food.exhaustion)
+        } else {
+            None
+        };
+        let together = self.drop_mode == DropMode::Together && extra_block;
         let dropped_before = self.game.dropped.len();
         let orbs_before: Vec<(u32, (u32, u32, u32))> = if together {
             self.game
@@ -897,6 +977,17 @@ impl Host for Native<'_, '_> {
             }
         }
         result?;
+        let changed = before.is_some() && self.block(p) != before;
+        // Vanilla playerDestroy adds 0.005 exhaustion for each extra block.
+        // Liteminer replaces that with its own configurable amount, so undo
+        // only the vanilla increment before Host::exhaust applies the mod cost.
+        if changed && extra_block && harvest_before
+            && let (Some(previous), Some(player)) = (exhaustion_before, self.game.player.as_mut())
+        {
+            let current = player.health.food.exhaustion;
+            player.health.food.exhaustion =
+                engine::remove_vanilla_extra_block_exhaustion(previous, current);
+        }
         if together {
             let target = self.origin.map(|coordinate| f64::from(coordinate) + 0.5);
             for item in self.game.dropped.iter_mut().skip(dropped_before) {
@@ -916,7 +1007,7 @@ impl Host for Native<'_, '_> {
                 }
             }
         }
-        Ok(before.is_some() && self.block(p) != before)
+        Ok(changed)
     }
     fn exhaust(&mut self, amount: f32) {
         if amount > 0.0
@@ -925,6 +1016,80 @@ impl Host for Native<'_, '_> {
             p.cause_food_exhaustion(amount);
         }
     }
+}
+struct PreviewNative<'g, 'r> {
+    game: &'g Game<'r>,
+}
+impl Host for PreviewNative<'_, '_> {
+    type Error = std::convert::Infallible;
+    fn player(&mut self) -> Player {
+        Player {
+            actor: self.game.acting_player_uuid(),
+            name: self.game.lan_acting_name.as_deref().unwrap_or(super::chat::PLAYER_NAME).to_owned(),
+            tick: self.game.world.game_time,
+            survival: self.game.remote.is_none()
+                && self.game.player.is_some()
+                && self.game.may_build()
+                && !self.game.creative,
+            sneaking: self.game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft),
+        }
+    }
+    fn block(&self, p: Position) -> Option<Block> {
+        if p[1] < self.game.world.shape.min_y
+            || p[1] >= self.game.world.shape.max_y()
+            || !self.game.world.loaded(p[0], p[2])
+        {
+            return None;
+        }
+        let state = self.game.world.block(p[0], p[1], p[2]);
+        let facts = self.game.res.facts().get(state);
+        let name = facts.name.to_string();
+        let plant = facts.classes.iter().any(|class| {
+            matches!(class.as_ref(), "FlowerBlock" | "TallGrassBlock" | "DoublePlantBlock")
+        });
+        let growth = ["age", "stage"].into_iter().find_map(|property| {
+            let value = self.game.native_block_property(p, property)?;
+            let values = self.game.pack.assets.registry.property_values(&name, property);
+            let max = values.len().checked_sub(1)?;
+            let current = values.iter().position(|candidate| *candidate == value.as_str())?;
+            Some((current as u32, max as u32))
+        });
+        Some(Block {
+            name,
+            state: state.0,
+            breakable: facts.hardness >= 0.0
+                && !self.game.world.is_air(state)
+                && facts.fluid == horizon_client::blocks::Fluid::None,
+            plant,
+            growth,
+        })
+    }
+    fn horizontal_forward(&self) -> Position {
+        engine::horizontal_direction_from_yaw(self.game.interaction_rotation().0)
+    }
+    fn tool(&self) -> Option<Tool> {
+        let stack = self.game.held()?;
+        let max = self.game.res.items().get(&stack.item).map_or(0, |i| i.max_damage);
+        Some(Tool {
+            item: stack.item.to_string(),
+            remaining: (max > 0).then_some(max.saturating_sub(stack.damage)),
+        })
+    }
+    fn can_harvest(&self, block: &Block) -> bool {
+        let facts = self.game.res.facts().get(horizon_world::registry::BlockStateId(block.state));
+        !facts.requires_tool
+            || self.game.res.items().correct_for_drops(self.game.held(), &block.name)
+    }
+    fn has_food(&self) -> bool {
+        self.game.player.as_ref().is_some_and(|p| p.health.food.food > 0)
+    }
+    fn has_nourishment(&self) -> bool {
+        self.game.potions.effects.get("farmersdelight:nourishment").is_some()
+    }
+    fn mine(&mut self, _p: Position, _preserve: bool) -> std::result::Result<bool, Self::Error> {
+        Ok(false)
+    }
+    fn exhaust(&mut self, _amount: f32) {}
 }
 impl Game<'_> {
     pub(super) fn veinminer_break_block(&mut self, pos: Position) -> Result<()> {
@@ -958,6 +1123,51 @@ impl Game<'_> {
                 .map(|_| ())
         })
     }
+    pub(super) fn veinminer_harvest_speed_modifier(&self) -> f32 {
+        let Some(hit) = self.pick() else { return 1.0; };
+        let origin = hit.pos;
+        let face = hit.face;
+        let mut host = PreviewNative { game: self };
+        let player = host.player();
+        let tool = host.tool();
+        let seed = host.block(origin);
+        STATES.with(|states| {
+            let mut states = states.borrow_mut();
+            let state = states.entry(self.world_root.clone()).or_default();
+            if state.config.is_none() {
+                state.config = Some(load_config().unwrap_or_else(|error| {
+                    eprintln!("Veinminer disabled: {error}");
+                    let mut config = Config::default();
+                    config.settings.enabled = false;
+                    config
+                }));
+            }
+            let config = state.config.as_ref().unwrap();
+            let action = seed.as_ref().filter(|block| block.breakable).and_then(|block| {
+                if config.settings.shape == Shape::Shapeless {
+                    config.action(&block.name, tool.as_ref().map(|t| t.item.as_str()))
+                } else if config.settings.enabled {
+                    Some((config.settings.clone(), std::collections::BTreeSet::new()))
+                } else {
+                    None
+                }
+            });
+            let action = action.filter(|(settings, _)| {
+                settings.enabled
+                    && settings.harvest_time_per_block_modifier_enabled
+                    && player.survival
+                    && state.runtime.enabled(player.actor)
+                    && (!settings.must_sneak || player.sneaking)
+                    && (!settings.permission_restricted || config.players.contains(&player.name))
+                    && (!settings.requires_food_for_vein_mining() || host.has_food())
+                    && state.runtime.cooldown_ready(player.actor, player.tick, settings.shape)
+            });
+            let Some((settings, targets)) = action else { return 1.0; };
+            let count = engine::selected_block_count(&host, origin, &targets, &settings, face);
+            engine::scaled_harvest_speed_modifier(count, settings.harvest_time_per_block_modifier)
+        })
+    }
+
     pub(super) fn veinminer_command(&mut self, command: &str) -> Option<bool> {
         with_state(self, |game, state| {
             let mut words = command.split_whitespace();
@@ -968,11 +1178,14 @@ impl Game<'_> {
             let actor = game.acting_player_uuid();
             let message = match args.as_slice() {
                 [] | ["status"] => format!(
-                    "Veinminer: {} | Shape: {} | Drops: {} | Tool safety: {}",
+                    "Veinminer: {} | Shape: {} | Drops: {} | Tool safety: {} | Food: {} | Zero hunger: {} | Harvest speed: {}",
                     if state.runtime.enabled(actor) { "on" } else { "off" },
                     state.config.as_ref().map_or("Shapeless", |c| c.settings.shape.label()),
                     state.config.as_ref().map_or("Together", |c| c.settings.drop_mode.label()),
-                    if state.config.as_ref().is_none_or(|c| c.settings.prevent_tool_breaking) { "on" } else { "off" }
+                    if state.config.as_ref().is_none_or(|c| c.settings.prevent_tool_breaking) { "on" } else { "off" },
+                    if state.config.as_ref().is_none_or(|c| c.settings.food_exhaustion_enabled) { "on" } else { "off" },
+                    if state.config.as_ref().is_none_or(|c| c.settings.allow_vein_mining_at_zero_hunger) { "allowed" } else { "blocked" },
+                    if state.config.as_ref().is_some_and(|c| c.settings.harvest_time_per_block_modifier_enabled) { "on" } else { "off" }
                 ),
                 ["shape", name] => {
                     let shape = match *name {
@@ -1046,6 +1259,75 @@ impl Game<'_> {
                     state.config.as_mut().unwrap().settings.prevent_tool_breaking = enabled;
                     format!("VeinMiner tool safety: {}", if enabled { "on" } else { "off" })
                 }
+                ["food", mode] => {
+                    let enabled = match *mode {
+                        "on" => true,
+                        "off" => false,
+                        _ => {
+                            game.command_failure(horizon_client::text::Text::literal(
+                                "Usage: /veinminer food [on|off]",
+                            ));
+                            return Some(false);
+                        }
+                    };
+                    if state.config.is_none() {
+                        match load_config() {
+                            Ok(config) => state.config = Some(config),
+                            Err(error) => {
+                                game.command_failure(horizon_client::text::Text::literal(error));
+                                return Some(false);
+                            }
+                        }
+                    }
+                    state.config.as_mut().unwrap().settings.food_exhaustion_enabled = enabled;
+                    format!("VeinMiner food exhaustion: {}", if enabled { "on" } else { "off" })
+                }
+                ["zero-hunger", mode] => {
+                    let allowed = match *mode {
+                        "allow" => true,
+                        "block" => false,
+                        _ => {
+                            game.command_failure(horizon_client::text::Text::literal(
+                                "Usage: /veinminer zero-hunger [allow|block]",
+                            ));
+                            return Some(false);
+                        }
+                    };
+                    if state.config.is_none() {
+                        match load_config() {
+                            Ok(config) => state.config = Some(config),
+                            Err(error) => {
+                                game.command_failure(horizon_client::text::Text::literal(error));
+                                return Some(false);
+                            }
+                        }
+                    }
+                    state.config.as_mut().unwrap().settings.allow_vein_mining_at_zero_hunger = allowed;
+                    format!("VeinMiner at zero hunger: {}", if allowed { "allowed" } else { "blocked" })
+                }
+                ["harvest-speed", mode] => {
+                    let enabled = match *mode {
+                        "on" => true,
+                        "off" => false,
+                        _ => {
+                            game.command_failure(horizon_client::text::Text::literal(
+                                "Usage: /veinminer harvest-speed [on|off]",
+                            ));
+                            return Some(false);
+                        }
+                    };
+                    if state.config.is_none() {
+                        match load_config() {
+                            Ok(config) => state.config = Some(config),
+                            Err(error) => {
+                                game.command_failure(horizon_client::text::Text::literal(error));
+                                return Some(false);
+                            }
+                        }
+                    }
+                    state.config.as_mut().unwrap().settings.harvest_time_per_block_modifier_enabled = enabled;
+                    format!("VeinMiner harvest speed modifier: {}", if enabled { "on" } else { "off" })
+                }
                 ["toggle"] | ["on"] | ["off"] => {
                     let on = match args[0] {
                         "on" => true,
@@ -1075,7 +1357,7 @@ impl Game<'_> {
                 }
                 _ => {
                     game.command_failure(horizon_client::text::Text::literal(
-                        "Usage: /veinminer [status|toggle|on|off|reload|shape <shapeless|tunnel|3x3|up|down>|drops <together|each>|tool-safety <on|off>]",
+                        "Usage: /veinminer [status|toggle|on|off|reload|shape <shapeless|tunnel|3x3|up|down>|drops <together|each>|tool-safety <on|off>|food <on|off>|zero-hunger <allow|block>|harvest-speed <on|off>]",
                     ));
                     return Some(false);
                 }
@@ -1098,6 +1380,7 @@ struct World {
     tool: Option<Tool>,
     forward: Position,
     food: bool,
+    nourishment: bool,
     harvest: bool,
     calls: Vec<(Position, bool)>,
     drops: usize,
@@ -1127,6 +1410,7 @@ impl World {
             }),
             forward: [0, 0, 1],
             food: true,
+            nourishment: false,
             harvest: true,
             calls: Vec::new(),
             drops: 0,
@@ -1166,6 +1450,9 @@ impl Host for World {
     }
     fn has_food(&self) -> bool {
         self.food
+    }
+    fn has_nourishment(&self) -> bool {
+        self.nourishment
     }
     fn mine(&mut self, p: Position, preserve: bool) -> Result<bool, Self::Error> {
         self.calls.push((p, preserve));
@@ -1315,6 +1602,7 @@ fn creative_adventure_sneak_tool_food_permissions_and_global_disable_gate_only_e
             2 => w.harvest = false,
             3 => {
                 c.settings.hunger_per_block = 0.2;
+                c.settings.allow_vein_mining_at_zero_hunger = false;
                 w.food = false;
             }
             4 => c.settings.permission_restricted = true,
@@ -1433,6 +1721,83 @@ fn prevent_tool_breaking_matches_liteminer_two_durability_buffer() {
     let report = mine(&mut world, &config);
     assert_eq!(report.extra_broken, 1);
     assert!(world.tool.is_none());
+}
+
+#[test]
+fn extra_block_removes_only_vanilla_exhaustion_before_custom_cost() {
+    assert_eq!(remove_vanilla_extra_block_exhaustion(0.0, 0.005), 0.0);
+    assert!((remove_vanilla_extra_block_exhaustion(3.999, 4.004) - 3.999).abs() < 0.0001);
+    assert!((remove_vanilla_extra_block_exhaustion(39.999, 40.0) - 39.999).abs() < 0.0001);
+    assert!((remove_vanilla_extra_block_exhaustion(2.0, 2.015) - 2.01).abs() < 0.0001);
+}
+
+#[test]
+fn liteminer_food_exhaustion_zero_food_and_nourishment_rules_match() {
+    // Liteminer default: 0.2 exhaustion for each extra block, not the origin.
+    let mut world = World::new(&[[0, 0, 0], [1, 0, 0], [2, 0, 0]]);
+    let report = mine(&mut world, &Config::default());
+    assert_eq!(report.extra_broken, 2);
+    assert!((world.exhaustion - 0.4).abs() < 0.0001);
+
+    // With the zero-hunger allowance disabled, a zero food bar blocks extras.
+    let mut world = World::new(&[[0, 0, 0], [1, 0, 0]]);
+    world.food = false;
+    let mut config = Config::default();
+    config.settings.allow_vein_mining_at_zero_hunger = false;
+    assert_eq!(mine(&mut world, &config).extra_broken, 0);
+    assert_eq!(world.calls.len(), 1);
+
+    // The default permits zero food; exhaustion still accumulates.
+    let mut world = World::new(&[[0, 0, 0], [1, 0, 0]]);
+    world.food = false;
+    assert_eq!(mine(&mut world, &Config::default()).extra_broken, 1);
+    assert!((world.exhaustion - 0.2).abs() < 0.0001);
+
+    // Farmers Delight Nourishment suppresses added exhaustion, not mining.
+    let mut world = World::new(&[[0, 0, 0], [1, 0, 0]]);
+    world.nourishment = true;
+    assert_eq!(mine(&mut world, &Config::default()).extra_broken, 1);
+    assert_eq!(world.exhaustion, 0.0);
+
+    // Disabling exhaustion also disables the zero-food gate.
+    let mut world = World::new(&[[0, 0, 0], [1, 0, 0]]);
+    world.food = false;
+    let mut config = Config::default();
+    config.settings.food_exhaustion_enabled = false;
+    config.settings.allow_vein_mining_at_zero_hunger = false;
+    assert_eq!(mine(&mut world, &config).extra_broken, 1);
+    assert_eq!(world.exhaustion, 0.0);
+}
+
+#[test]
+fn liteminer_harvest_speed_modifier_uses_selected_block_count_formula() {
+    assert_eq!(scaled_harvest_speed_modifier(0, 2.0), 1.0);
+    assert_eq!(scaled_harvest_speed_modifier(1, 2.0), 1.0);
+    let expected = 1.0f32 / 1.4f32; // (3 - 1) * 2.0 * 0.1
+    assert!((scaled_harvest_speed_modifier(3, 2.0) - expected).abs() < 0.0001);
+}
+
+#[test]
+fn liteminer_food_and_harvest_settings_defaults_and_json_round_trip() {
+    let defaults = Settings::default();
+    assert!(defaults.food_exhaustion_enabled);
+    assert_eq!(defaults.food_exhaustion, 0.2);
+    assert!(defaults.allow_vein_mining_at_zero_hunger);
+    assert!(!defaults.harvest_time_per_block_modifier_enabled);
+    assert_eq!(defaults.harvest_time_per_block_modifier, 2.0);
+
+    let mut config = Config::default();
+    config.settings.food_exhaustion_enabled = false;
+    config.settings.food_exhaustion = 0.35;
+    config.settings.allow_vein_mining_at_zero_hunger = false;
+    config.settings.harvest_time_per_block_modifier_enabled = true;
+    config.settings.harvest_time_per_block_modifier = 3.5;
+    let decoded = Config::from_json(&serde_json::to_string(&config).unwrap()).unwrap();
+    assert!(!decoded.settings.food_exhaustion_enabled);
+    assert_eq!(decoded.settings.food_exhaustion, 0.35);
+    assert!(!decoded.settings.allow_vein_mining_at_zero_hunger);
+    assert!(decoded.settings.harvest_time_per_block_modifier_enabled);
+    assert_eq!(decoded.settings.harvest_time_per_block_modifier, 3.5);
 }
 
 #[test]

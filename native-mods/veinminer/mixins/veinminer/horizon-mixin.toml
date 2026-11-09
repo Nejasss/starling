@@ -1,6 +1,6 @@
 [mod]
 id = "veinminer"
-version = "0.5.0"
+version = "0.6.0"
 priority = 100
 
 [compatibility]
@@ -21,6 +21,19 @@ helper = "mining.rs"
 bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "pos", ty = "[i32;3]", value = "pos" },
+]
+
+[[injection]]
+id = "harvest-speed"
+kind = "MODIFY_EXPRESSION_VALUE"
+target = "horizon_client::game::Game<'_>::tick_mining"
+selector = "self.items().mining_speed(held, &facts.name)"
+require = 1
+ordinal = 0
+helper = "harvest.rs"
+bindings = [
+  { name = "value", ty = "f32", value = "$value" },
+  { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
 ]
 
 [[injection]]
