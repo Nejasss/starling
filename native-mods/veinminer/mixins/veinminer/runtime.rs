@@ -227,6 +227,12 @@ pub struct Config {
     pub blocks: BTreeSet<String>,
     pub groups: Vec<Group>,
     pub players: BTreeSet<String>,
+    /// Registry-backed block tags used by both config selectors and Liteminer tags.
+    #[serde(skip)]
+    pub block_tags: BTreeMap<String, BTreeSet<String>>,
+    /// Registry-backed item tags used by config tool selectors and Liteminer tags.
+    #[serde(skip)]
+    pub item_tags: BTreeMap<String, BTreeSet<String>>,
 }
 fn id_valid(s: &str) -> bool {
     let Some((namespace, path)) = s.split_once(':') else {
@@ -240,6 +246,18 @@ fn id_valid(s: &str) -> bool {
         && path
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"/_.-".contains(&b))
+}
+
+fn selector_valid(value: &str) -> bool {
+    id_valid(value.strip_prefix('#').unwrap_or(value))
+}
+
+fn selector_matches(tags: &BTreeMap<String, BTreeSet<String>>, selector: &str, value: &str) -> bool {
+    if let Some(tag) = selector.strip_prefix('#') {
+        tags.get(tag).is_some_and(|members| members.contains(value))
+    } else {
+        selector == value
+    }
 }
 impl Config {
     pub fn from_json(source: &str) -> Result<Self, String> {
@@ -271,9 +289,9 @@ impl Config {
                 .iter()
                 .flat_map(|g| g.blocks.iter().chain(&g.tools)),
         ) {
-            if !id_valid(id) {
+            if !selector_valid(id) {
                 return Err(format!(
-                    "expected explicit namespaced block/item id, got {id:?}"
+                    "expected namespaced block/item id or #namespace:tag, got {id:?}"
                 ));
             }
         }
@@ -283,28 +301,56 @@ impl Config {
         let groups: Vec<_> = self
             .groups
             .iter()
-            .filter(|g| g.blocks.contains(name))
+            .filter(|group| {
+                group.blocks.iter().any(|selector| {
+                    selector_matches(&self.block_tags, selector, name)
+                })
+            })
             .collect();
-        if groups.is_empty() && !self.blocks.contains(name) {
+        let selected_by_global_list = self
+            .blocks
+            .iter()
+            .any(|selector| selector_matches(&self.block_tags, selector, name));
+        if groups.is_empty() && !selected_by_global_list {
             return None;
         }
         let mut settings = self.settings.clone();
         if let Some(first) = groups.first() {
             first.overrides.apply(&mut settings);
         }
-        let tools: BTreeSet<_> = groups.iter().flat_map(|g| &g.tools).collect();
+        let tools: BTreeSet<_> = groups.iter().flat_map(|group| &group.tools).collect();
         if !tools.is_empty()
-            && tool.is_none_or(|id| !tools.iter().any(|allowed| allowed.as_str() == id))
+            && tool.is_none_or(|id| {
+                !tools
+                    .iter()
+                    .any(|allowed| selector_matches(&self.item_tags, allowed, id))
+            })
         {
             return None;
         }
-        let targets = if settings.separate_group_mining || groups.is_empty() {
+        let targets = if settings.separate_group_mining {
             BTreeSet::from([name.to_owned()])
         } else {
-            groups
-                .iter()
-                .flat_map(|g| g.blocks.iter().cloned())
-                .collect()
+            let selectors: Vec<&String> = if groups.is_empty() {
+                self.blocks.iter().collect()
+            } else {
+                groups.iter().flat_map(|group| group.blocks.iter()).collect()
+            };
+            let mut expanded = BTreeSet::new();
+            for selector in selectors {
+                if let Some(tag) = selector.strip_prefix('#') {
+                    if let Some(members) = self.block_tags.get(tag) {
+                        expanded.extend(members.iter().cloned());
+                    }
+                } else {
+                    expanded.insert(selector.clone());
+                }
+            }
+            if expanded.is_empty() {
+                BTreeSet::from([name.to_owned()])
+            } else {
+                expanded
+            }
         };
         Some((settings, targets))
     }
@@ -356,6 +402,8 @@ impl Default for Config {
             .into(),
             groups,
             players: BTreeSet::new(),
+            block_tags: BTreeMap::new(),
+            item_tags: BTreeMap::new(),
         }
     }
 }
@@ -390,7 +438,11 @@ pub trait Host {
     fn horizontal_forward(&self) -> Position;
     // None means unloaded/outside build bounds. This must never load a chunk.
     fn block(&self, position: Position) -> Option<Block>;
+    /// Liteminer tag policy: excludes and non-empty block whitelists.
+    fn block_allowed(&self, _block: &Block) -> bool { true }
     fn tool(&self) -> Option<Tool>;
+    /// Liteminer's excluded-tools tags; defaults preserve pure-engine test hosts.
+    fn tool_allowed(&self) -> bool { true }
     fn can_harvest(&self, block: &Block) -> bool;
     /// Food-bar level only; saturation does not make a zero food bar nonzero.
     fn has_food(&self) -> bool;
@@ -500,7 +552,10 @@ fn offset(position: Position, delta: Position) -> Option<Position> {
 
 fn candidate_block<H: Host>(host: &H, position: Position, settings: &Settings) -> Option<Block> {
     let block = host.block(position)?;
-    if !block.breakable || settings.need_correct_tool && !host.can_harvest(&block) {
+    if !block.breakable
+        || !host.block_allowed(&block)
+        || settings.need_correct_tool && !host.can_harvest(&block)
+    {
         return None;
     }
     Some(block)
@@ -651,7 +706,10 @@ fn preview_with_orientation<H: Host>(
     }
 
     let Some(origin_block) = host.block(origin) else { return Vec::new(); };
-    if !origin_block.breakable || !targets.contains(&origin_block.name) {
+    if !origin_block.breakable
+        || !host.block_allowed(&origin_block)
+        || !targets.contains(&origin_block.name)
+    {
         return Vec::new();
     }
     let mut hits = Vec::new();
@@ -665,6 +723,7 @@ fn preview_with_orientation<H: Host>(
         }
         let Some(block) = host.block(position) else { continue; };
         if !block.breakable
+            || !host.block_allowed(&block)
             || !same_shapeless_family(&origin_block, &block, targets, settings)
             || settings.need_correct_tool && !host.can_harvest(&block)
         {
@@ -752,7 +811,10 @@ impl Runtime {
         let player = host.player();
         let tool = host.tool();
         let seed = host.block(origin);
-        let action = seed.as_ref().filter(|b| b.breakable).and_then(|b| {
+        let action = host.tool_allowed().then_some(()).and_then(|_| {
+            seed.as_ref()
+                .filter(|block| block.breakable && host.block_allowed(block))
+                .and_then(|b| {
             if config.settings.shape == Shape::Shapeless {
                 config.action(&b.name, tool.as_ref().map(|t| t.item.as_str()))
             } else if config.settings.enabled {
@@ -761,7 +823,7 @@ impl Runtime {
                 Some((config.settings.clone(), BTreeSet::new()))
             } else {
                 None
-            }
+            })
         });
         let action = action.filter(|(settings, _)| {
             settings.enabled
@@ -905,8 +967,78 @@ fn load_config() -> std::result::Result<Config, String> {
 
 fn load_config_for(game: &Game<'_>) -> std::result::Result<Config, String> {
     let mut config = load_config()?;
+    let items = game.res.items();
+    config.block_tags = items
+        .block_tags
+        .iter()
+        .map(|(tag, members)| (tag.clone(), members.iter().cloned().collect()))
+        .collect();
+    config.item_tags = items
+        .item_tags
+        .iter()
+        .map(|(tag, members)| (tag.clone(), members.iter().cloned().collect()))
+        .collect();
     sync_shape_from_setting(game, &mut config);
     Ok(config)
+}
+
+fn registry_tag_contains(
+    tags: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+    tag: &str,
+    value: &str,
+) -> bool {
+    tags.get(tag).is_some_and(|members| members.contains(value))
+}
+
+fn registry_block_allowed(game: &Game<'_>, block: &str) -> bool {
+    let tags = &game.res.items().block_tags;
+    if registry_tag_contains(tags, "liteminer:excluded_blocks", block)
+        || registry_tag_contains(tags, "ftbultimine:excluded_blocks", block)
+    {
+        return false;
+    }
+    let whitelist_enabled = ["liteminer:block_whitelist", "ftbultimine:block_whitelist"]
+        .iter()
+        .any(|tag| tags.get(*tag).is_some_and(|members| !members.is_empty()));
+    !whitelist_enabled
+        || registry_tag_contains(tags, "liteminer:block_whitelist", block)
+        || registry_tag_contains(tags, "ftbultimine:block_whitelist", block)
+}
+
+fn registry_tool_allowed(game: &Game<'_>, item: &str) -> bool {
+    let tags = &game.res.items().item_tags;
+    !registry_tag_contains(tags, "liteminer:excluded_tools", item)
+        && !registry_tag_contains(tags, "ftbultimine:excluded_tools", item)
+}
+
+fn registry_tool_included(game: &Game<'_>, item: &str) -> bool {
+    let tags = &game.res.items().item_tags;
+    registry_tag_contains(tags, "liteminer:included_tools", item)
+        || registry_tag_contains(tags, "ftbultimine:included_tools", item)
+}
+
+fn block_from_state(game: &Game<'_>, position: Position, state: horizon_world::registry::BlockStateId) -> Block {
+    let facts = game.res.facts().get(state);
+    let name = facts.name.to_string();
+    let plant = facts.classes.iter().any(|class| {
+        matches!(class.as_ref(), "FlowerBlock" | "TallGrassBlock" | "DoublePlantBlock")
+    });
+    let growth = ["age", "stage"].into_iter().find_map(|property| {
+        let value = game.native_block_property(position, property)?;
+        let values = game.pack.assets.registry.property_values(&name, property);
+        let max = values.len().checked_sub(1)?;
+        let current = values.iter().position(|candidate| *candidate == value.as_str())?;
+        Some((current as u32, max as u32))
+    });
+    Block {
+        name,
+        state: state.0,
+        breakable: facts.hardness >= 0.0
+            && !game.world.is_air(state)
+            && facts.fluid == horizon_client::blocks::Fluid::None,
+        plant,
+        growth,
+    }
 }
 
 // native_data_dir is shared by the window, the integrated server thread and a LAN host.
@@ -1009,6 +1141,17 @@ impl Host for Native<'_, '_> {
     fn horizontal_forward(&self) -> Position {
         engine::horizontal_direction_from_yaw(self.game.interaction_rotation().0)
     }
+    fn tool(&self) -> Option<Tool> {    fn block_allowed(&self, block: &Block) -> bool {
+        registry_block_allowed(self.game, &block.name)
+    }
+    fn tool_allowed(&self) -> bool {
+        self.game
+            .held()
+            .is_none_or(|stack| registry_tool_allowed(self.game, &stack.item))
+    }
+    fn horizontal_forward(&self) -> Position {
+        engine::horizontal_direction_from_yaw(self.game.interaction_rotation().0)
+    }
     fn tool(&self) -> Option<Tool> {
         let stack = self.game.held()?;
         let max = self
@@ -1034,6 +1177,10 @@ impl Host for Native<'_, '_> {
                 .res
                 .items()
                 .correct_for_drops(self.game.held(), &block.name)
+            || self
+                .game
+                .held()
+                .is_some_and(|stack| registry_tool_included(self.game, &stack.item))
     }
     fn has_food(&self) -> bool {
         self.game.player.as_ref().is_some_and(|p| p.health.food.food > 0)
@@ -1121,10 +1268,19 @@ struct PreviewNative<'g, 'r> {
     game: &'g Game<'r>,
     actor: [i32; 4],
     active: bool,
+    origin_override: Option<(Position, Block)>,
 }
 impl Host for PreviewNative<'_, '_> {
     type Error = std::convert::Infallible;
-    fn player(&mut self) -> Player {
+    fn player(&mut self) -> Player {    fn block_allowed(&self, block: &Block) -> bool {
+        registry_block_allowed(self.game, &block.name)
+    }
+    fn tool_allowed(&self) -> bool {
+        self.game
+            .held()
+            .is_none_or(|stack| registry_tool_allowed(self.game, &stack.item))
+    }
+
         Player {
             actor: self.actor,
             name: self.game.lan_acting_name.as_deref().unwrap_or(super::chat::PLAYER_NAME).to_owned(),
@@ -1137,6 +1293,11 @@ impl Host for PreviewNative<'_, '_> {
         }
     }
     fn block(&self, p: Position) -> Option<Block> {
+        if let Some((origin, block)) = &self.origin_override {
+            if *origin == p {
+                return Some(block.clone());
+            }
+        }
         if p[1] < self.game.world.shape.min_y
             || p[1] >= self.game.world.shape.max_y()
             || !self.game.world.loaded(p[0], p[2])
@@ -1181,6 +1342,10 @@ impl Host for PreviewNative<'_, '_> {
         let facts = self.game.res.facts().get(horizon_world::registry::BlockStateId(block.state));
         !facts.requires_tool
             || self.game.res.items().correct_for_drops(self.game.held(), &block.name)
+            || self
+                .game
+                .held()
+                .is_some_and(|stack| registry_tool_included(self.game, &stack.item))
     }
     fn has_food(&self) -> bool {
         self.game.player.as_ref().is_some_and(|p| p.health.food.food > 0)
@@ -1222,19 +1387,22 @@ fn refresh_selection(game: &Game<'_>, state: &mut State) -> Option<CachedSelecti
         sync_shape_from_setting(game, config);
     }
 
-    let mut host = PreviewNative { game, actor, active: true };
+    let mut host = PreviewNative { game, actor, active: true, origin_override: None };
     let player = host.player();
     let tool = host.tool();
-    let Some(seed) = host.block(hit.pos).filter(|block| block.breakable) else {
+    let Some(seed) = host
+        .block(hit.pos)
+        .filter(|block| block.breakable && host.block_allowed(block))
+    else {
         state.selection = None;
         return None;
     };
 
     let (settings, targets) = {
         let config = state.config.as_ref()?;
-        let action = if config.settings.shape == Shape::Shapeless {
+        let action = if host.tool_allowed() && config.settings.shape == Shape::Shapeless {
             config.action(&seed.name, tool.as_ref().map(|t| t.item.as_str()))
-        } else if config.settings.enabled {
+        } else if host.tool_allowed() && config.settings.enabled {
             Some((config.settings.clone(), std::collections::BTreeSet::new()))
         } else {
             None
@@ -1526,6 +1694,174 @@ impl Game<'_> {
         self.native_text(batch, &label, [x + 4.0, y + 3.0], 0xF9FFFE, true);
     }
 
+
+    /// Liteminer's ItemStack.useOn continuation, reached only after the clicked
+    /// block's own interaction declined the click. It first performs the normal
+    /// tool transform on the origin; only a successful transform claims the use.
+    pub(super) fn veinminer_use_item_on(
+        &mut self,
+        stack: &horizon_client::items::ItemStack,
+        origin: Position,
+        face: Position,
+        claimed: &mut bool,
+    ) {
+        if *claimed
+            || self.hand != horizon_client::first_person::Hand::Main
+            || !self.native_on("veinminer")
+            || !self.native_playing()
+        {
+            return;
+        }
+        let actor = self.acting_player_uuid();
+        if !is_active(self, actor) {
+            return;
+        }
+        let tiered_tool = self.res.items().get(&stack.item).is_some_and(|info| {
+            !info.tool.is_empty() || info.tool_damage_per_block.is_some()
+        });
+        if !tiered_tool || !registry_tool_allowed(self, &stack.item) {
+            return;
+        }
+        let origin_state = self.world.block(origin[0], origin[1], origin[2]);
+        let origin_block = block_from_state(self, origin, origin_state);
+
+        let mut config = match load_config_for(self) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("VeinMiner disabled: {error}");
+                return;
+            }
+        };
+        sync_shape_from_setting(self, &mut config);
+        if !config.settings.enabled {
+            return;
+        }
+
+        // Do not change vanilla behaviour when the player is outside the
+        // configured activation/sneak/permission/food conditions.
+        let mut eligibility_host = PreviewNative {
+            game: self,
+            actor,
+            active: true,
+            origin_override: Some((origin, origin_block.clone())),
+        };
+        let player = eligibility_host.player();
+        let has_food = eligibility_host.has_food();
+        let sneaking = player.sneaking;
+        let player_name = player.name.clone();
+        let tool_allowed = eligibility_host.tool_allowed();
+        let block_allowed = eligibility_host.block_allowed(&origin_block);
+        drop(eligibility_host);
+        if !tool_allowed
+            || !block_allowed
+            || config.settings.must_sneak && !sneaking
+            || config.settings.permission_restricted && !config.players.contains(&player_name)
+            || !player.survival
+            || config.settings.requires_food_for_vein_mining() && !has_food
+        {
+            return;
+        }
+
+        // Interactions use the selected shape independently of the mining block
+        // groups, matching Liteminer's OnBlockInteraction path.
+        let targets = if config.settings.shape == Shape::Shapeless {
+            std::collections::BTreeSet::from([origin_block.name.clone()])
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        let action = Some((config.settings.clone(), targets));
+
+        // This is the ordinary Horizon path for axes, hoes and shovels. If it
+        // declines, leave the item completely untouched for vanilla/use hooks.
+        match self.use_block_transformer(stack, origin, face) {
+            Ok(true) => *claimed = true,
+            Ok(false) => return,
+            Err(error) => {
+                eprintln!("VeinMiner origin interaction failed: {error}");
+                return;
+            }
+        }
+        let Some((settings, targets)) = action.filter(|(settings, _)| {
+            settings.enabled
+                && (!settings.must_sneak || sneaking)
+                && (!settings.permission_restricted || config.players.contains(&player_name))
+                && (!settings.requires_food_for_vein_mining() || has_food)
+        }) else {
+            return;
+        };
+
+        let mut host = PreviewNative {
+            game: self,
+            actor,
+            active: true,
+            origin_override: Some((origin, origin_block)),
+        };
+        let mut hits = engine::preview_with_face(&host, origin, &targets, &settings, face);
+        drop(host);
+        if hits.len() <= 1 {
+            return;
+        }
+        hits.sort_by_key(|hit| {
+            (hit.position[0] - origin[0]).abs()
+                + (hit.position[1] - origin[1]).abs()
+                + (hit.position[2] - origin[2]).abs()
+        });
+        let nourishment = self.potions.effects.get("farmersdelight:nourishment").is_some();
+        for hit in hits.into_iter().filter(|hit| hit.position != origin) {
+            let Some(current) = self.held() else {
+                break;
+            };
+            if current.item != stack.item {
+                break;
+            }
+            let max_damage = self.res.items().get(&stack.item).map_or(0, |info| info.max_damage);
+            let remaining = max_damage.saturating_sub(current.damage);
+            if settings.decrease_durability
+                && settings.prevent_tool_breaking
+                && max_damage > 0
+                && remaining <= 2
+            {
+                break;
+            }
+            let preserved = if settings.decrease_durability {
+                None
+            } else {
+                let saved = self.inventory[self.selected].clone();
+                if let Some(held) = self.inventory[self.selected].as_mut() {
+                    held.damage = 0;
+                }
+                Some(saved)
+            };
+            let transformed = self.use_block_transformer(stack, hit.position, face);
+            if let Some(saved) = preserved {
+                match (self.inventory[self.selected].as_mut(), saved) {
+                    (Some(now), Some(was)) if now.item == was.item => now.damage = was.damage,
+                    (None, Some(was)) => self.inventory[self.selected] = Some(was),
+                    _ => {}
+                }
+            }
+            match transformed {
+                Ok(true) => {
+                    let exhaustion = if settings.food_exhaustion_enabled {
+                        settings.exhaustion_per_block()
+                    } else {
+                        0.0
+                    };
+                    if exhaustion > 0.0 && !nourishment {
+                        if let Some(player) = self.player.as_mut() {
+                            player.cause_food_exhaustion(exhaustion);
+                        }
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("VeinMiner interaction stopped: {error}");
+                    break;
+                }
+            }
+        }
+    }
+
     pub(super) fn veinminer_break_block(&mut self, pos: Position) -> Result<()> {
         with_state(self, |game, state| {
             if state.config.is_none() {
@@ -1576,7 +1912,7 @@ impl Game<'_> {
                 None => return 1.0,
             },
         };
-        let mut host = PreviewNative { game: self, actor, active: true };
+        let mut host = PreviewNative { game: self, actor, active: true, origin_override: None };
         let player = host.player();
         let tool = host.tool();
         let seed = host.block(origin);
@@ -1595,15 +1931,21 @@ impl Game<'_> {
                 sync_shape_from_setting(self, config);
             }
             let config = state.config.as_ref().unwrap();
-            let action = seed.as_ref().filter(|block| block.breakable).and_then(|block| {
-                if config.settings.shape == Shape::Shapeless {
-                    config.action(&block.name, tool.as_ref().map(|t| t.item.as_str()))
-                } else if config.settings.enabled {
-                    Some((config.settings.clone(), std::collections::BTreeSet::new()))
-                } else {
-                    None
-                }
-            });
+            let action = if host.tool_allowed() {
+                seed.as_ref()
+                    .filter(|block| block.breakable && host.block_allowed(block))
+                    .and_then(|block| {
+                        if config.settings.shape == Shape::Shapeless {
+                            config.action(&block.name, tool.as_ref().map(|t| t.item.as_str()))
+                        } else if config.settings.enabled {
+                            Some((config.settings.clone(), std::collections::BTreeSet::new()))
+                        } else {
+                            None
+                        }
+                    })
+            } else {
+                None
+            };
             let action = action.filter(|(settings, _)| {
                 settings.enabled
                     && is_active(self, player.actor)
@@ -1954,7 +2296,43 @@ fn mine(world: &mut World, config: &Config) -> Report {
 }
 
 #[test]
+fn registry_tag_selectors_match_blocks_tools_and_expand_group_targets() {
+    let mut config = Config::default();
+    config.groups = vec![Group {
+        id: "tagged-logs".into(),
+        blocks: ["#minecraft:logs".to_owned()].into(),
+        tools: ["#minecraft:axes".to_owned()].into(),
+        overrides: Overrides::default(),
+    }];
+    config.block_tags.insert(
+        "minecraft:logs".into(),
+        ["minecraft:oak_log".to_owned(), "minecraft:spruce_log".to_owned()].into(),
+    );
+    config.item_tags.insert(
+        "minecraft:axes".into(),
+        ["minecraft:diamond_axe".to_owned()].into(),
+    );
+    config.validate().unwrap();
+    let (_, targets) = config
+        .action("minecraft:oak_log", Some("minecraft:diamond_axe"))
+        .expect("the block and tool tags should match");
+    assert!(targets.contains("minecraft:oak_log"));
+    assert!(targets.contains("minecraft:spruce_log"));
+    assert!(config.action("minecraft:oak_log", Some("minecraft:stone" )).is_none());
+}
+
+#[test]
+fn config_accepts_namespaced_tag_selectors_but_rejects_malformed_tags() {
+    let mut config = Config::default();
+    config.blocks = ["#minecraft:mineable/pickaxe".to_owned()].into();
+    config.validate().unwrap();
+    config.blocks = ["#bad tag".to_owned()].into();
+    assert!(config.validate().is_err());
+}
+
+#[test]
 fn connected_diagonals_group_variants_and_original_once_keep_drops_and_xp() {
+
     let mut w = World::new(&[[0, 0, 0], [1, 1, 1], [2, 1, 1], [20, 0, 0]]);
     w.blocks
         .insert([2, 1, 1], block("minecraft:deepslate_iron_ore", 2));
