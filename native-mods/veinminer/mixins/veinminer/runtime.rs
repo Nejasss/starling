@@ -1141,16 +1141,13 @@ impl Host for Native<'_, '_> {
     fn horizontal_forward(&self) -> Position {
         engine::horizontal_direction_from_yaw(self.game.interaction_rotation().0)
     }
-    fn tool(&self) -> Option<Tool> {    fn block_allowed(&self, block: &Block) -> bool {
+    fn block_allowed(&self, block: &Block) -> bool {
         registry_block_allowed(self.game, &block.name)
     }
     fn tool_allowed(&self) -> bool {
         self.game
             .held()
             .is_none_or(|stack| registry_tool_allowed(self.game, &stack.item))
-    }
-    fn horizontal_forward(&self) -> Position {
-        engine::horizontal_direction_from_yaw(self.game.interaction_rotation().0)
     }
     fn tool(&self) -> Option<Tool> {
         let stack = self.game.held()?;
@@ -1272,15 +1269,7 @@ struct PreviewNative<'g, 'r> {
 }
 impl Host for PreviewNative<'_, '_> {
     type Error = std::convert::Infallible;
-    fn player(&mut self) -> Player {    fn block_allowed(&self, block: &Block) -> bool {
-        registry_block_allowed(self.game, &block.name)
-    }
-    fn tool_allowed(&self) -> bool {
-        self.game
-            .held()
-            .is_none_or(|stack| registry_tool_allowed(self.game, &stack.item))
-    }
-
+    fn player(&mut self) -> Player {
         Player {
             actor: self.actor,
             name: self.game.lan_acting_name.as_deref().unwrap_or(super::chat::PLAYER_NAME).to_owned(),
@@ -1291,6 +1280,14 @@ impl Host for PreviewNative<'_, '_> {
             sneaking: self.game.keys.contains(&winit::keyboard::KeyCode::ShiftLeft),
             active: self.active,
         }
+    }
+    fn block_allowed(&self, block: &Block) -> bool {
+        registry_block_allowed(self.game, &block.name)
+    }
+    fn tool_allowed(&self) -> bool {
+        self.game
+            .held()
+            .is_none_or(|stack| registry_tool_allowed(self.game, &stack.item))
     }
     fn block(&self, p: Position) -> Option<Block> {
         if let Some((origin, block)) = &self.origin_override {
