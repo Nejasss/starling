@@ -823,7 +823,7 @@ impl Runtime {
                 Some((config.settings.clone(), BTreeSet::new()))
             } else {
                 None
-            })
+            }})
         });
         let action = action.filter(|(settings, _)| {
             settings.enabled
