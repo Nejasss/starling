@@ -1,0 +1,59 @@
+[mod]
+id = "bodyguard"
+version = "0.1.0"
+priority = 100
+
+[compatibility]
+horizon_revision = "7c38f33c1ce1fb18ae513c7b60ab2dda178eb282"
+
+[[module]]
+id = "runtime"
+file = "crates/horizon-client/src/game.rs"
+name = "bodyguard"
+source = "runtime.rs"
+
+# A carved pumpkin placed on a chest on an iron block builds a bodyguard.
+[[injection]]
+id = "place"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_place_block"
+helper = "place.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "stack", ty = "&horizon_client::mod_api::ItemStack", value = "stack" },
+  { name = "pos", ty = "[i32; 3]", value = "pos" },
+]
+
+# Right click a bodyguard: an axe arms it, anything else is refused.
+[[injection]]
+id = "interact"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_interact_entity"
+helper = "interact.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "entity", ty = "i32", value = "entity" },
+  { name = "stack", ty = "Option<&horizon_client::mod_api::ItemStack>", value = "stack" },
+  { name = "claimed", ty = "&mut bool", value = "&mut *claimed" },
+]
+
+# What a bodyguard's blow does depends on its axe.
+[[injection]]
+id = "damage"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_living_incoming_damage"
+helper = "damage.rs"
+bindings = [
+  { name = "causing", ty = "i32", value = "causing" },
+  { name = "amount", ty = "&mut f32", value = "&mut *amount" },
+]
+
+# Once a tick per player: their bodyguards follow them.
+[[injection]]
+id = "tick"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_player_tick"
+helper = "tick.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+]
