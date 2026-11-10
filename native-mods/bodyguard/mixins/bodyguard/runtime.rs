@@ -11,8 +11,11 @@
 use super::Game;
 use horizon_client::mod_api::{Host, ItemStack, Tag, Text};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+pub const ID: &str = "bodyguard";
+pub const VERSION: &str = "0.1.2";
+pub const DESCRIPTION: &str = "Rakit bodyguard: iron block, chest kosong, carved pumpkin. Klik kanan pakai kapak. Selalu aktif.";
 const BASE_KIND: &str = "minecraft:iron_golem";
 /// Health points of a bodyguard.
 const MAX_HEALTH: f32 = 20.0;
@@ -49,6 +52,7 @@ struct Guard {
 
 static GUARDS: Mutex<Vec<Guard>> = Mutex::new(Vec::new());
 static TICKS: AtomicU64 = AtomicU64::new(0);
+static LOADED: AtomicBool = AtomicBool::new(false);
 
 fn guards() -> std::sync::MutexGuard<'static, Vec<Guard>> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
@@ -68,10 +72,18 @@ pub fn on_place(game: &mut Game<'_>, stack: &ItemStack, pos: [i32; 3]) {
         return;
     }
     let air = game.world.air;
-    let host: &mut dyn Host = game;
     let chest = [pos[0], pos[1] - 1, pos[2]];
     let base = [pos[0], pos[1] - 2, pos[2]];
-    if host.block(chest) != "minecraft:chest" || host.block(base) != "minecraft:iron_block" {
+    // DEBUG 0.1.2: say in chat what the hook sees.
+    let (b1, b2, who) = {
+        let h: &mut dyn Host = &mut *game;
+        (h.block(chest), h.block(base), h.acting_player().is_some())
+    };
+    game.native_chat(&format!(
+        "[bodyguard] labu dipasang: bawah1={b1:?} bawah2={b2:?} pemain={who}"
+    ));
+    let host: &mut dyn Host = game;
+    if b1 != "minecraft:chest" || b2 != "minecraft:iron_block" {
         return;
     }
     let Some(builder) = host.acting_player() else {
@@ -185,6 +197,10 @@ pub fn on_damage(causing: i32, amount: &mut f32) {
 
 /// `native_player_tick`'s HEAD: the acting player's bodyguards come closer.
 pub fn on_player_tick(game: &mut Game<'_>) {
+    // DEBUG 0.1.2: proves the tick hook runs.
+    if !LOADED.swap(true, Ordering::Relaxed) {
+        game.native_chat("[bodyguard] 0.1.2 aktif (hook tick jalan)");
+    }
     let host: &mut dyn Host = game;
     let Some(me) = host.acting_player() else {
         return;
